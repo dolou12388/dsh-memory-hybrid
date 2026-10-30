@@ -1,0 +1,39 @@
+# dsh-memory-hybrid bundle patch
+#
+# 不在此处写 inject：交给模块自己的导出决定。
+# 手写 inject 会覆盖模块导出，一旦与实现不一致就变成难查的 pending
+# （本插件踩过：patch 里写着 storageDomain，模块已改成软探测，结果插件永远不启动）。
+#
+# ⚠ 这里**不写** jevApiKey / embedApiKey。
+#
+# 宿主的 describe() 用 `value !== undefined` 判断「密钥配过没有」，而 patch
+# 里写 `key: ''` 会把「未配置」变成「配置了空串」，设置页于是永远显示
+# 「已配置」。实测过：带上这两行，secrets 侧信道恒为 set=true。
+# 它们由设置页写入用户层，不需要在这里给初值。
+#
+# 需要 storage 服务的访问许可，模块导出里已声明。若你的 profile 把
+# storage-domain 路由到了 json，而想要 sqlite，把 storageMode 设为 sqlite
+# 即可 —— 插件会自建 domain facility，不去改动你的 profile 配置。
+
+- insert:
+    - id: dsh-memory-hybrid
+      name: 'dsh-memory-hybrid'
+      config:
+        autoRecall: true
+        recallLimit: 6
+        dim: 256
+        contextOrder: 10500
+        jevEndpoint: ''
+        jevModel: jev-1.14.0
+        sweepOnStart: true
+        verbose: false
+        # auto 优先自带 sqlite；json 沿用 profile 路由
+        storageMode: auto
+        # 留空则放 <storages>/memory_hybrid.sqlite
+        sqliteFile: ''
+        # 嵌入模型（语义召回）。inherit 沿用 dsh 当前模型，多半没有 /embeddings，
+        # 要真用语义召回就改成 custom 并填下面两项（密钥请在设置页填）。
+        # 这些都能在「设置 → 插件 → 记忆」里改，写在这里只是设定初值。
+        embedSource: inherit
+        embedBaseURL: ''
+        embedModel: ''

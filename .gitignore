@@ -1,0 +1,41 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 打包产物
+*.tgz
+*.tar.gz
+
+# 运行时数据（记忆库落在用户目录，不该进仓库）
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+data/
+
+# 日志与临时文件
+*.log
+npm-debug.log*
+.tmp/
+tmp/
+
+# 本机环境
+.DS_Store
+Thumbs.db
+desktop.ini
+.env
+.env.*
+!.env.example
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~
+
+# AI 工作记忆（决策笔记，属个人工作区，不随仓库分发）
+.workbuddy/
+
+# 设计文档：本地保留，不进版本库
+docs/

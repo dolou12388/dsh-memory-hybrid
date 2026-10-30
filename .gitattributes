@@ -1,0 +1,24 @@
+# 默认：自动识别文本，检出时用平台原生换行
+* text=auto
+
+# 源码与文档统一用 LF（跨平台协作、diff 干净）
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.cjs   text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.py    text eol=lf
+LICENSE text eol=lf
+
+# 二进制：不要碰
+*.wasm  binary
+*.tgz   binary
+*.png   binary
+*.jpg   binary
+*.ico   binary
+
+# Windows 批处理需要 CRLF
+*.bat   text eol=crlf
+*.cmd   text eol=crlf

@@ -35,12 +35,12 @@
 dsh-memory/
 ├── plugin/                    插件包（可 npm pack 分发）
 │   ├── src/                   16 个模块，4,314 行
-│   ├── client.js              设置页「记忆」tab（803 行）
+│   ├── client.js              浏览器端：设置页 tab + 侧栏面板（1,024 行）
 │   ├── vendor/sqlite/         内嵌 SQLite wasm 引擎（零外部依赖的关键）
 │   ├── cordis.patch.yml       bundle 补丁，声明插件默认配置
 │   ├── package.json           dsh.bundle.patch 指向上面那个 yml
 │   └── README.md              安装 / 设计 / 调参 / 排查，都在这
-├── test/                      5 个套件，374 项（不随 npm 包分发）
+├── test/                      6 个套件，401 项（不随 npm 包分发）
 └── tools/
     └── simulate.py            设计期数值探针（不是测试）
 ```
@@ -52,7 +52,7 @@ dsh-memory/
 | 你想做的事 | 读这里 |
 |---|---|
 | **装上并跑起来** | [`plugin/README.md`](plugin/README.md) 第五节「装配」 |
-| **改配置** | 设置 → 内置插件 → 记忆（可视化表单，15 个字段） |
+| **改配置** | 侧边栏「记忆」图标，或 设置 → 插件 → 记忆（同一份配置，两个入口） |
 | 理解衰减/唤醒/心情为什么这样设计 | [`plugin/README.md`](plugin/README.md) 第二~四节 |
 | 改参数，看会影响什么 | [`plugin/README.md`](plugin/README.md) 第十节「调参」 |
 | 排查故障 | [`plugin/README.md`](plugin/README.md) 第九节「已知限制」+ 第十一节「验证」 |
@@ -115,9 +115,15 @@ backend-contract    48 项    存储后端契约
 sqlite-embedded     38 项    内嵌引擎 / 持久化 / 损坏自愈
 embed-config        83 项    嵌入配置继承 / 断言 / 设置页控件匹配
 host-wiring         33 项    真实 cordis + storage + domain 装配
+sidebar-panel       27 项    侧栏三处插槽注册（真实执行 apply）
 ```
 
 `host-wiring` 用的是宿主真实服务而非 mock —— 装配时序问题只有真 cordis 才复现得出。
+
+`sidebar-panel` 是唯一真正执行 `plugin/client.js` 的套件：用 `new Function` 把
+浏览器端代码装进沙箱，桩掉 React 与四个宿主 UI 包，让 `apply(ctx)` 真跑一遍，
+再检查 `ctx.slots.register` 实际收到的参数。核心那条断言是
+「侧栏 `id` === 主面板 `key`」—— 对不上时图标点下去毫无反应，且不报错。
 
 ---
 

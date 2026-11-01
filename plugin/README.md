@@ -5,6 +5,8 @@
 
 写给 DeepSeek Harness（dsh）。目标不是「把所有对话塞进向量库」，而是让记忆**有轻重、会遗忘、可复活**。
 
+配置入口有两个，看的是同一份数据：左侧边栏的**记忆**图标，和**设置 → 插件 → 记忆**。
+
 ---
 
 ## 一、它解决什么
@@ -424,9 +426,9 @@ sqlite3 ~/.dsh/storages/memory_hybrid.sqlite \
 
 ## 六、配置项
 
-**全部配置都可以在 dsh 客户端的设置页里改**，不需要手编 YAML：打开 **设置 → 插件 → 记忆**，改完即时生效、无需重启。
+**全部配置都可以在 dsh 客户端里改**，不需要手编 YAML：打开 **设置 → 插件 → 记忆**，或点左侧边栏的**记忆**图标，改完即时生效、无需重启。
 
-这一页由插件自己提供，不是宿主变出来的。`ctx.settings.describe()` 只回传 schema **数据**（`autoGenerate` 只决定是否把 schema 一起给你），宿主**不会**据此渲染表单 —— `settings.plugins.tab` 插槽里原本只有官方那个只读的插件清单，没有任何通用渲染器。所以本插件带了一份浏览器端代码 `plugin/client.js`，自己往插槽里注册了一个 id 为 `memory-hybrid` 的 tab。
+这一页由插件自己提供，不是宿主变出来的。`ctx.settings.describe()` 只回传 schema **数据**（`autoGenerate` 只决定是否把 schema 一起给你），宿主**不会**据此渲染表单 —— `settings.plugins.tab` 插槽里原本只有官方那个只读的插件清单，没有任何通用渲染器。所以本插件带了一份浏览器端代码 `plugin/client.js`，自己往插槽里注册了一个 id 为 `memory-hybrid` 的 tab，外加一对侧栏图标 + 主面板。
 
 这个页面是真正的可视化表单，不是一堆待填的文本框 —— 每个字段按语义选控件：
 
@@ -446,6 +448,74 @@ sqlite3 ~/.dsh/storages/memory_hybrid.sqlite \
 - **「已覆盖 / 恢复默认」的徽标位挪到了说明文字旁。** 宿主的 `Switch` / `SegmentedControl` 没有 `SettingsValueField` 那个徽标槽，所以把「恢复默认」渲染成标签右侧的小按钮。信息没丢，位置换了。
 
 带 `role("secret")` 的字段（`embedApiKey` / `jevApiKey`）渲染成只写输入框：一旦存过就只显示「已配置」，值不再回传给前端，输入框留空保存也不会把已存的密钥清掉。
+
+### 侧栏面板：同一份配置的第二个入口
+
+除了「设置 → 插件 → 记忆」，左侧边栏还有一个**记忆**图标，点开就是同一张表单。两个入口不是两套实现 —— 都由同一个 `MemoryCardController` 供数，改一边、另一边看到的就是改后的值，不存在同步问题。
+
+注册要占两个插槽，且**必须成对**：
+
+```js
+const PANEL_ID = "memory-hybrid";   // 侧栏 id
+const PANEL_ORDER = 2;              // 排在官方面板之后的顺序位
+
+// ① 侧栏图标：list 类插槽，必须有 id
+ctx.slots.inject("sidebar.panellist", () =>
+  ctx.slots.register(
+    { name: "sidebar.panellist", id: PANEL_ID, order: PANEL_ORDER, locale: NS, label: () => t("panel") },
+    MemoryIcon,
+  ),
+);
+
+// ② 主面板：keyed 类插槽，key 必须等于上面那个 id
+ctx.slots.inject("main", () =>
+  ctx.slots.register(
+    { name: "main", key: PANEL_ID, locale: NS, inject: props },
+    MemoryPanelPage,
+  ),
+);
+```
+
+**`sidebar` 的 `id` 与 `main` 的 `key` 必须严格相等。** 宿主点图标时执行的是 `ctx.layout.selectPanel(id)`，`main` 槽按 `key` 取组件；两边对不上，图标点下去**什么都不发生**，控制台连一行警告都没有。这是本节唯一一个「错了也静默」的地方，所以专门写了测试锁住它（见下）。
+
+两者的插槽种类不同，字段要求也不同：
+
+| 插槽 | 种类 | 必需字段 | 少了会怎样 |
+|---|---|---|---|
+| `sidebar.panellist` | `list` | `id` | 注册被槽校验拒掉，图标不存在 |
+| `main` | `keyed` | `key` | 同上，面板永远不渲染 |
+
+`label` 给的是 `() => t("panel")` 而不是字符串 —— 字符串在注册那一刻就被求值，用户切语言不会跟着变。
+
+`MemoryIcon` 是三层递减的圆角矩形，用 `currentColor` 上色并读 `props.active` 调透明度（`active ? 1 : 0.85`）。**不要写死颜色**，侧栏在选中/悬停/深色模式下都由宿主改父级 `color`，写死就跟主题脱节。
+
+`MemoryPanelPage` 只是一层壳：`main` 槽给的是个空盒子（`MainPanel` 直接 `renderSlot("main")`，不带内边距），而 `MemoryCard` 返回的 `SettingsForm` 是给设置页正文用的、不自带边距，直接塞进去会贴窗口边。所以外面包了 `padding: 28px 32px 48px` + `maxWidth: 720` 居中。
+
+### 三处注册怎么一起收口
+
+设置页 tab、侧栏图标、主面板是**三次** `ctx.slots.inject`，但 `configForms.whileServed()` 只认**一个**返回值当 disposer。最初把三处写成独立语句、回调返回 `undefined`，结果是：命名空间一撤销，`whileServed` 拿不到任何东西可调，三个注册全残留在插槽里 —— 下次重新服务时会叠加出第二份。
+
+正确写法是让每处 `inject` 各自返回自己的 disposer，再合成一个：
+
+```js
+const slot = (name, options, component) =>
+  ctx.slots.inject(name, () => ctx.slots.register({ name, ...options }, component));
+
+ctx.configForms.whileServed([NS], () => {
+  const offs = [
+    slot("settings.plugins.tab", { id: "memory-hybrid", order: 20, ... }, MemoryCard),
+    slot("sidebar.panellist", { id: PANEL_ID, order: PANEL_ORDER, ... }, MemoryIcon),
+    slot("main", { key: PANEL_ID, ... }, MemoryPanelPage),
+  ];
+  return () => {
+    for (const off of offs) {
+      try { off?.(); } catch {}
+    }
+  };
+});
+```
+
+`try/catch` 不是防御性冗余：三次 `register` 的返回类型由宿主决定，其中一个返回 `undefined` 时不该让另外两个漏掉。
 
 ### 让它出现在设置页里，有三个必须同时满足的条件
 
@@ -469,6 +539,8 @@ sqlite3 ~/.dsh/storages/memory_hybrid.sqlite \
 同理，`cordis.patch.yml` 里也**不能**写 `embedApiKey: ''` —— 那会把「未配置」变成「配置了空串」，回到同一个坑。
 
 **关于第 3 条**：`dsh.client.platform` 必须是 `web`，`exports["./client"]` 指向的文件必须存在且含 `__ModuleLoader__.load`。改完这些前端相关的文件**必须重启 dsh** —— client-modules 的 `pkgMeta` 按 sourceKey 缓存，含「非客户端包」的否定判决。
+
+这一条对侧栏同样生效，而且**是侧栏能不能出现的前提**：侧栏图标跟设置页 tab 住在同一个 `client.js` 里，产物不进启动图，两者一起消失。
 
 ### 写完之后怎么自己确认
 
@@ -940,7 +1012,7 @@ cd <工作区根>          # 与 plugin/ 同级的那一层
 node test/run-all.mjs
 ```
 
-五个套件共 374 项：
+六个套件共 401 项：
 
 | 套件 | 项数 | 覆盖 |
 |---|---|---|
@@ -949,12 +1021,27 @@ node test/run-all.mjs
 | `sqlite-embedded.test.mjs` | 38 | 内嵌引擎、持久化、损坏自愈 |
 | `embed-config.test.mjs` | 83 | 嵌入配置继承、断言、设置页控件匹配 |
 | `host-wiring.test.mjs` | 33 | 真实 cordis + storage + domain 装配 |
+| `sidebar-panel.test.mjs` | 27 | 侧栏三处插槽注册（真实执行 `apply()`） |
 
 `host-wiring` 用的是宿主真实的 `Storage` / `DomainFacility`，
 不是 mock —— 装配时序这类问题只有真 cordis 才复现得出。
 
 `embed-config` 里有一组是静态分析 `client.js` 断言「布尔必须用 `Switch`、
 枚举必须用 `SegmentedControl`」，防止配置页退化成纯文本框。
+
+`sidebar-panel` 是唯一真正**执行** `plugin/client.js` 的套件。前面五个要么
+跑服务端、要么正则读源码 —— 那种断言只能证明「代码里写了这行」，
+证明不了「注册到宿主之后长得对」。这个套件用 `new Function` 把 client.js
+装进沙箱（桩掉 `window.__ModuleLoader__`、React、四个宿主 UI 包），
+让 `apply(ctx)` 真的跑一遍，然后检查 `ctx.slots.register` 实际收到的参数：
+
+- `sidebar.panellist` 的 `id` 与 `main` 的 `key` 都是 `"memory-hybrid"`（相等性断言）
+- 两者拿到的是**不同**的组件函数
+- 设置页 tab 的 `id` 仍是 `"memory-hybrid"`，没被侧栏改造带歪
+- 撤销前插槽里有 3 项，调一次 `whileServed` 的 disposer 后归 0
+
+React 桩故意做得极简（`createElement` 只返回 `{type, props, children}`，不渲染），
+因为这里验的是**注册面**不是**渲染结果**；真要验渲染得上 jsdom，成本不成正比。
 
 ---
 

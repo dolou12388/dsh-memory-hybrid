@@ -127,6 +127,10 @@ window.__ModuleLoader__.load({
       invalidNumber: "请填数字；留空表示使用默认值。",
       configured: "已配置",
       notConfigured: "未配置",
+
+      panel: "记忆",
+      panelDesc: "分级 · 衰减 · 唤醒 · 淘汰",
+      backToSettings: "也可在 设置 → 插件 → 记忆 中修改同一份配置",
     };
 
     const en = {
@@ -190,6 +194,10 @@ window.__ModuleLoader__.load({
       invalidNumber: "Enter a number, or leave blank to use the default.",
       configured: "Configured",
       notConfigured: "Not set",
+
+      panel: "Memory",
+      panelDesc: "Tiered · decaying · revivable",
+      backToSettings: "The same configuration is also under Settings → Plugins → Memory",
     };
 
     /* ------------------------------------------------------------------ *
@@ -621,6 +629,161 @@ window.__ModuleLoader__.load({
     }
 
     /* ------------------------------------------------------------------ *
+     * 侧栏面板
+     * ------------------------------------------------------------------ */
+
+    /**
+     * 侧栏图标：一枚「记忆分层」符号。
+     *
+     * 画三层递减的横条（上层最宽、下层最窄），表达记忆按重要性分层后逐层
+     * 沉淀；最底一层用低透明度，暗示「沉睡但仍可复活」。不用文字或复杂图形，
+     * 保证 16–18px 的侧栏槽位里仍然可辨。
+     *
+     * @param {object} props - 组件属性
+     * @param {number} [props.size] - 边长（像素）
+     * @param {boolean} [props.active] - 选中态
+     * @returns {object} React 元素
+     */
+    function MemoryIcon(props) {
+      const size = props.size || 18;
+      const active = Boolean(props.active);
+      // 选中时整枚图标提亮；未选中时留一点透明，与侧栏其它图标一致。
+      const opacity = active ? 1 : 0.85;
+
+      return h(
+        "svg",
+        {
+          width: size,
+          height: size,
+          viewBox: "0 0 24 24",
+          fill: "none",
+          xmlns: "http://www.w3.org/2000/svg",
+          "aria-hidden": "true",
+          focusable: "false",
+        },
+        [
+          // 上层：最宽，实心
+          h("rect", {
+            key: "top",
+            x: 3,
+            y: 5,
+            width: 18,
+            height: 3.4,
+            rx: 1.7,
+            fill: "currentColor",
+            opacity,
+          }),
+          // 中层：略窄
+          h("rect", {
+            key: "mid",
+            x: 5,
+            y: 10.3,
+            width: 14,
+            height: 3.4,
+            rx: 1.7,
+            fill: "currentColor",
+            opacity: opacity * 0.72,
+          }),
+          // 底层：最窄且最淡，表达「沉到低层但未删除」
+          h("rect", {
+            key: "low",
+            x: 7.5,
+            y: 15.6,
+            width: 9,
+            height: 3.4,
+            rx: 1.7,
+            fill: "currentColor",
+            opacity: opacity * 0.42,
+          }),
+        ],
+      );
+    }
+
+    /**
+     * 侧栏面板页：把设置页那张卡片放进一个独立的主面板容器。
+     *
+     * 为什么还要一层：`main` 槽只提供一个空盒子（`dsh-client-ui-layout` 的
+     * `MainPanel` 直接 `renderSlot("main")`，不带内边距），而 `MemoryCard`
+     * 返回的 `SettingsForm` 是给设置页正文用的、不自带边距。放进主面板若不
+     * 自己加容器，表单会贴到窗口边缘。
+     *
+     * 配置本身不另开一套：仍由同一个 `MemoryCardController` 供数，所以这里
+     * 只是「换了个壳」，与设置页 tab 看到的是同一份配置、同一个保存动作。
+     *
+     * @param {object} props - 插槽渲染器拼装的属性
+     * @returns {object} React 元素
+     */
+    function MemoryPanelPage(props) {
+      const { t } = props;
+
+      return h(
+        "div",
+        {
+          style: {
+            height: "100%",
+            overflowY: "auto",
+            padding: "28px 32px 48px",
+            boxSizing: "border-box",
+          },
+        },
+        h(
+          "div",
+          { style: { maxWidth: 720, margin: "0 auto" } },
+          [
+            h(
+              "div",
+              { key: "head", style: { marginBottom: 20 } },
+              [
+                h(
+                  "h1",
+                  {
+                    key: "title",
+                    style: {
+                      margin: 0,
+                      fontSize: 18,
+                      fontWeight: 600,
+                      lineHeight: 1.4,
+                      color: "var(--dsw-alias-label-primary)",
+                    },
+                  },
+                  t("title"),
+                ),
+                h(
+                  "p",
+                  {
+                    key: "desc",
+                    style: {
+                      margin: "6px 0 0",
+                      fontSize: 13,
+                      lineHeight: 1.5,
+                      color: "var(--dsw-alias-label-tertiary)",
+                    },
+                  },
+                  t("panelDesc"),
+                ),
+              ],
+            ),
+            // 卡片本体：与设置页 tab 完全同一份组件与数据源
+            h(MemoryCard, { key: "card", ...props }),
+            h(
+              "p",
+              {
+                key: "foot",
+                style: {
+                  margin: "18px 0 0",
+                  fontSize: 12,
+                  lineHeight: 1.5,
+                  color: "var(--dsw-alias-label-tertiary)",
+                },
+              },
+              t("backToSettings"),
+            ),
+          ],
+        ),
+      );
+    }
+
+    /* ------------------------------------------------------------------ *
      * 配置卡片控制器
      * ------------------------------------------------------------------ */
 
@@ -748,6 +911,11 @@ window.__ModuleLoader__.load({
 
     const inject = ["slots", "locale", "configForms"];
 
+    /** 侧栏面板 id，同时是 `main` keyed slot 的 key —— 两者必须一致，否则点图标不会切到本页。 */
+    const PANEL_ID = "memory-hybrid";
+    /** 侧栏排序：插件按钮是 0，本面板紧随。 */
+    const PANEL_ORDER = 2;
+
     function apply(ctx) {
       ctx.effect(
         () => ctx.locale.register(NS, { zh, en }),
@@ -772,30 +940,83 @@ window.__ModuleLoader__.load({
         };
       }, "memory-hybrid: form");
 
+      // 传给页面的那一副面孔；控制器没建起来时给空 hooks，
+      // 页面会落到「未加载」态而不是崩掉。
+      const props = () => (controller ? controller.inject() : { hooks: {} });
+
+      /**
+       * 注册一处插槽，返回它自己的 disposer。
+       *
+       * `ctx.slots.inject(name, fn)` 的语义是「等 name 这个插槽被声明者就绪后
+       * 再执行 fn」，并返回用于撤销的 disposer。所以这里必须把 `register`
+       * 的结果原样返回出去 —— 中间多包一层聚合会让 whileServed 拿不到可调用
+       * 的 off()，命名空间撤走时注册就残留了。
+       */
+      const slot = (name, options, component) =>
+        ctx.slots.inject(name, () => ctx.slots.register({ name, ...options }, component));
+
       // whileServed：只有宿主真的提供了本命名空间才注册页面。
       // 少了这层守卫，命名空间没被服务时页面上会出现一个永远空白的 tab。
+      //
+      // 三处注册要一起收口，但 whileServed 只认一个返回值，所以把三个
+      // disposer 合成一个：任一撤销都走同一条路径，避免只撤一半。
       ctx.effect(
         () =>
-          ctx.configForms.whileServed([NS], () =>
-            ctx.slots.inject("settings.plugins.tab", () =>
-              ctx.slots.register(
+          ctx.configForms.whileServed([NS], () => {
+            const offs = [
+              // ① 设置页 tab（原有入口，保留）
+              slot(
+                "settings.plugins.tab",
                 {
-                  name: "settings.plugins.tab",
                   id: "memory-hybrid",
                   order: 20,
                   label: () => t("tab"),
                   locale: NS,
-                  inject: () => (controller ? controller.inject() : { hooks: {} }),
+                  inject: props,
                 },
                 MemoryCard,
               ),
-            ),
-          ),
+
+              // ② 侧栏图标：点击后由宿主调 layout.selectPanel(PANEL_ID)
+              slot(
+                "sidebar.panellist",
+                {
+                  id: PANEL_ID,
+                  order: PANEL_ORDER,
+                  locale: NS,
+                  label: () => t("panel"),
+                },
+                MemoryIcon,
+              ),
+
+              // ③ 主面板：keyed slot，key 必须与侧栏 id 相同
+              slot(
+                "main",
+                {
+                  key: PANEL_ID,
+                  locale: NS,
+                  inject: props,
+                },
+                MemoryPanelPage,
+              ),
+            ];
+
+            return () => {
+              for (const off of offs) {
+                try {
+                  off?.();
+                } catch {
+                  // 某一处已自行撤销时不应连累其余，逐个吞掉继续。
+                }
+              }
+            };
+          }),
         "memory-hybrid: page",
       );
     }
 
     exports.NS = NS;
+    exports.PANEL_ID = PANEL_ID;
     exports.apply = apply;
     exports.inject = inject;
     return module.exports;

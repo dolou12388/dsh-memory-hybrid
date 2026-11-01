@@ -285,7 +285,12 @@ window.__ModuleLoader__.load({
     function MemoryCard(props) {
       const { t } = props;
       // 投影里已经压平了 shell 与每个字段的状态，组件只按需取用。
-      const state = props.useMemoryCard((snapshot) => snapshot);
+      //
+      // `useMemoryCard` 缺席的唯一场合是控制器没建起来（`remote` 全程未就绪）。
+      // 那时不该崩，落到「未加载」态 —— 与宿主自己表达不可用的方式一致。
+      const state = typeof props.useMemoryCard === "function"
+        ? props.useMemoryCard((snapshot) => snapshot)
+        : { available: false, writable: false, dirty: false, invalid: false, saving: false, failed: false, secrets: {} };
 
       const disabled = !state.writable;
 
@@ -784,6 +789,241 @@ window.__ModuleLoader__.load({
     }
 
     /* ------------------------------------------------------------------ *
+     * 自备 scope：绕开宿主对非 loopback 页面的表单禁用
+     * ------------------------------------------------------------------ */
+
+    /**
+     * 一个只靠 `ctx.remote.settings` 的 scope，接口与宿主
+     * `configForms.get(ns)` 返回的 `ConfigFormController` 完全一致。
+     *
+     * ## 为什么需要它
+     *
+     * 宿主的 `ConfigFormController` 在构造时按页面来源决定「是否连 Host」：
+     *
+     *     const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";
+     *
+     * `isLoopback` 只认 `localhost` / `[::1]` / `127.x.x.x`
+     * （`dsh-client-connection/lib/client.js:1333` 的 `isLoopbackHostname`）。
+     * 用公网 IP 或域名打开页面时它是 **false**，于是 `persistence = "memory"`，
+     * 而 memory 分支下：
+     *
+     *     status: persistence === "host" ? "loading" : "unavailable"   // 1118 行
+     *     load()   { if (this.persistence === "memory") return; }      // 1407 行
+     *     ensure() { if (this.persistence === "memory") return; }      // 1423 行
+     *     enqueue(){ if (this.persistence === "memory") return false; } // 1213 行
+     *
+     * 三件事同时发生：`status` 一经构造就是 `"unavailable"`、镜像永不发起
+     * describe、写入一律直接返回 false。而 `SettingsFormModel.shell()` 的
+     * 判定是 `available: snapshot.status === "ready"`（primitives 7194 行），
+     * 于是卡片稳定渲染 `labels.unavailable` —— 就是界面上那句
+     * 「该插件当前未加载，暂时无法配置。」
+     *
+     * 关键点：**这不是插件没加载**。`MemoryPanelPage` 自己渲染的标题、副标题、
+     * 脚注都正常，说明插件在跑、组件树在跑；失败的只是表单那一层。
+     *
+     * ## 为什么不照抄宿主这套保守策略
+     *
+     * 宿主的保守有它的道理 —— 非本地页面的写入在它看来可能失效。但它的
+     * 「失效」假设来自 `settings/conflict` 一类并发写冲突，而不是权限：
+     * Host 端的 `dsh-api-settings-controller` 对 `describe` / `mutate` 没有
+     * 任何 loopback 门禁（`--trusted-host` 只影响 `/api` 的请求准入，见
+     * `dsh-client-connection/lib/index.js:210`）。既然 RPC 通、Host 认，
+     * 那就在前端补上宿主没做的那一层，而不是让整个面板空着。
+     *
+     * 官方插件里也有同样的取舍痕迹：`dsh-client-ui-settings-general` 用
+     * `ctx.remote.$host.isLoopback ? new SettingsDocumentStore(...) : void 0`
+     * 主动放弃，但它放弃的只是「用原生编辑器打开配置文件」这一个动作。
+     *
+     * ## 契约（必须与 ConfigFormController 对齐，因为它喂的是同一个
+     *    `SettingsFormModel`）
+     *
+     *   · `getSnapshot()` → `{status, value, base, user, revision, writable, mode}`
+     *   · `subscribe(fn)`  → 返回退订函数
+     *   · `mutate(ops, expectedRevision)` → Promise<boolean>
+     */
+    class RemoteScope {
+      /**
+       * @param {object} ctx 插件上下文
+       * @param {string} namespace 设置命名空间
+       * @param {object} remote `ctx.remote`，由调用方经 `ctx.inject(["remote"])` 取到
+       */
+      constructor(ctx, namespace, remote) {
+        this.ctx = ctx;
+        this.namespace = namespace;
+        this.remote = remote;
+
+        this.state = {
+          status: "loading",
+          value: undefined,
+          base: undefined,
+          user: undefined,
+          revision: undefined,
+          writable: false,
+          mode: "remote",
+          // 密钥侧信道：Host 在 describe 与写回答里都会带上，形如
+          // `[{path:["embedApiKey"], set:true}]`。明文永不过网。
+          secrets: undefined,
+        };
+
+        this.listeners = new Set();
+        this.disposed = false;
+        this.generation = 0;
+
+        this.load();
+      }
+
+      /** @returns {object} 当前快照（引用稳定，变更时才换） */
+      getSnapshot() {
+        return this.state;
+      }
+
+      /**
+       * 订阅快照变化。
+       *
+       * **订阅时立即回调一次**：`load()` 在构造里就发了，订阅往往晚于它落地，
+       * 只靠后续变更通知的话订阅者可能永远收不到那次变化（tab 探测就踩过：
+       * describe 在 subscribe 之前完成，回调再也不会被触发）。
+       *
+       * @param {Function} listener 快照变化回调
+       * @returns {Function} 退订
+       */
+      subscribe(listener) {
+        this.listeners.add(listener);
+        try {
+          listener();
+        } catch {
+          // 首次回调抛错不该让订阅失败
+        }
+        return () => this.listeners.delete(listener);
+      }
+
+      setState(patch) {
+        if (this.disposed) return;
+        this.state = { ...this.state, ...patch };
+        for (const listener of this.listeners) {
+          try {
+            listener();
+          } catch {
+            // 单个订阅者抛错不该拖垮其余订阅者
+          }
+        }
+      }
+
+      /**
+       * 从 Host 读一次 describe，取本命名空间那一行。
+       *
+       * @returns {Promise<boolean>} 是否拿到了本命名空间的视图
+       */
+      async load() {
+        const generation = ++this.generation;
+        try {
+          const response = await this.remote.settings.describe();
+          if (this.disposed || generation !== this.generation) return false;
+          if (!response.ok) {
+            this.setState({ status: "unavailable" });
+            return false;
+          }
+          this.fold(response.value);
+          return true;
+        } catch {
+          if (this.disposed || generation !== this.generation) return false;
+          // 通道异常：标 unavailable 而不是永远 loading，让界面能说出实话
+          this.setState({ status: "unavailable" });
+          return false;
+        }
+      }
+
+      /**
+       * 把一份 describe 文档折叠进本快照。
+       *
+       * @param {object} view `{ writable, namespaces: [...] }`
+       */
+      fold(view) {
+        const row = view?.namespaces?.find((candidate) => candidate.ns === this.namespace);
+        if (row === undefined) {
+          // Host 没在服务本命名空间 —— 这才是真正意义上的「未加载」：
+          // 插件没进配置树，或 describe 的过滤链把它跳过了
+          // （dsh-settings/lib/index.js:420 的 fiber.state !== 2 等）。
+          this.setState({ status: "unavailable", writable: view?.writable === true });
+          return;
+        }
+        this.setState({
+          status: "ready",
+          value: row.value,
+          base: row.base,
+          user: row.user,
+          revision: row.revision,
+          writable: view?.writable === true,
+          secrets: row.secrets,
+        });
+      }
+
+      /**
+       * 写一批 path 操作，成功后把 Host 回答的视图折叠回来。
+       *
+       * 与宿主的 `enqueue` 有一处刻意的不同：宿主在 `persistence === "memory"`
+       * 时直接 `return false`（不写也不发请求）；这里照发 —— 因为 remote 通道
+       * 本身是通的，写不写得进由 Host 裁决。
+       *
+       * @param {Array<object>} ops `{op:"set"|"unset", path:[...], value?}`
+       * @param {number} [expectedRevision] 读到的 revision，用于并发围栏
+       * @returns {Promise<boolean>} Host 是否接受
+       */
+      async mutate(ops, expectedRevision) {
+        if (this.disposed) return false;
+        const revision = expectedRevision ?? this.state.revision;
+        try {
+          const response = await this.remote.settings.mutate(this.namespace, ops, revision);
+          if (this.disposed) return true;
+          if (!response.ok) {
+            // 冲突/被拒：重读一次，让界面回到 Host 的真相
+            await this.load();
+            return false;
+          }
+          // Host 在写成功后直接回该命名空间的新视图，省掉一次 describe
+          this.fold({ writable: this.state.writable, namespaces: [response.value] });
+          return true;
+        } catch {
+          await this.load();
+          return false;
+        }
+      }
+
+      dispose() {
+        this.disposed = true;
+        this.listeners.clear();
+      }
+    }
+
+    /**
+     * 判断宿主给的 scope 有没有可能变成 `ready`。
+     *
+     * 只读一次同步快照，绝不等：`ConfigFormController` 在构造时就把终态定死了
+     * （`persistence === "memory"` → `status` 恒为 `"unavailable"`，且不订阅
+     * 镜像），所以「现在不是 ready 且永远不会变」与「现在 loading 但马上会好」
+     * 必须区分开，否则会在正常部署上把宿主 scope 白白换掉。
+     *
+     * 判据用 `mode`：宿主把它设成 `persistence`，自建的是 `"remote"`。
+     * `mode === "memory"` 就是那条「永不就绪」的分支。
+     *
+     * @param {object} scope 候选 scope
+     * @returns {boolean} 是否值得继续用
+     */
+    function isScopeServable(scope) {
+      let snapshot;
+      try {
+        snapshot = scope.getSnapshot();
+      } catch {
+        return false;
+      }
+      if (snapshot === undefined || snapshot === null) return false;
+      if (snapshot.status === "ready") return true;
+      // 非 ready 时唯一的死刑判决是 memory 持久化；其余（loading / idle）
+      // 都还在路上，交给订阅去等。
+      return snapshot.mode !== "memory";
+    }
+
+    /* ------------------------------------------------------------------ *
      * 配置卡片控制器
      * ------------------------------------------------------------------ */
 
@@ -796,13 +1036,31 @@ window.__ModuleLoader__.load({
      * （`SettingsNamespaceView.secrets`，形如 `[{path:["embedApiKey"], set:true}]`）。
      */
     class MemoryCardController {
-      constructor(ctx, scope) {
+      /**
+       * @param {object} ctx 插件上下文
+       * @param {object} remote `ctx.remote`
+       * @param {object} [hostScope] 宿主的 `configForms.get(NS)`；不可用时自建
+       */
+      constructor(ctx, remote, hostScope) {
         this.ctx = ctx;
-        this.scope = scope;
+        this.remote = remote;
         this.secrets = { embedApiKey: false, jevApiKey: false };
 
+        // 绝大多数部署里宿主 scope 是好的，直接用它 —— 它额外提供
+        // `developerTools` 等本插件用不到的协作面，但契约与自建的一致。
+        //
+        // 只有在它「拿不到」或「拿得到但永远 ready 不了」时才自建：
+        // 后者是非 loopback 页面的常态（见 RemoteScope 的注释），此时
+        // 边界上没有任何报错，唯一的表征是 status 恒为 unavailable。
+        this.ownScope = undefined;
+        this.scope = hostScope ?? this.adoptRemoteScope();
+        if (hostScope !== undefined && !isScopeServable(hostScope)) {
+          this.ownScope = this.adoptRemoteScope();
+          this.scope = this.ownScope;
+        }
+
         this.form = new SettingsFormModel(
-          scope,
+          this.scope,
           fieldSpecs(),
           secretFields().map((field) => ({
             field,
@@ -820,15 +1078,20 @@ window.__ModuleLoader__.load({
         // 只订阅 scope 是不够的：mirror 的内部读取是异步的，scope 的首次
         // `ready` 早于它，首次渲染时密钥状态会停留在「未配置」。
         //
-        // configForms 缺席时没有侧信道可订阅，退化成只订阅 scope —— 此时
-        // 密钥字段一律显示「未配置」，是这一路降级唯一诚实的表达。
+        // 自建 scope 时没有镜像可订阅，密钥侧信道改从它自己的 describe 结果
+        // 里取（RemoteScope 折叠过的那份），下面 readSecrets 统一走 scope。
         const forms = ctx.get?.("configForms");
-        if (forms !== undefined) {
+        if (forms !== undefined && this.ownScope === undefined) {
           const mirror = forms.describe();
           this.unsubscribeMirror = mirror.subscribe(() => this.readSecrets());
         }
-        this.unsubscribe = scope.subscribe(() => this.readSecrets());
+        this.unsubscribe = this.scope.subscribe(() => this.readSecrets());
         this.readSecrets();
+      }
+
+      /** 建一个只走 remote 的 scope，并随控制器一起释放。 */
+      adoptRemoteScope() {
+        return new RemoteScope(this.ctx, NS, this.remote);
       }
 
       /** 页面渲染所需的全部状态。 */
@@ -878,10 +1141,7 @@ window.__ModuleLoader__.load({
       readSecrets() {
         const next = { embedApiKey: false, jevApiKey: false };
         try {
-          const forms = this.ctx.get?.("configForms");
-          if (forms === undefined) throw new Error("configForms 缺席");
-          const mirror = forms.describe();
-          const view = mirror.getSnapshot().view;
+          const view = this.describeView();
           const row = view?.namespaces?.find((candidate) => candidate.ns === NS);
           for (const secret of row?.secrets ?? []) {
             const field = secret.path?.[0];
@@ -898,6 +1158,42 @@ window.__ModuleLoader__.load({
         this.store.set(this.projection());
       }
 
+      /**
+       * 取一份 describe 视图，供密钥侧信道使用。
+       *
+       * 两条来源，取决于当前用的是哪个 scope：
+       *
+       *   · 宿主 scope —— 走 `configForms.describe()` 的共享镜像。它给整份
+       *     文档，与本表单同源，最准。
+       *   · 自建 scope —— 宿主镜像根本不会加载（`persistence === "memory"`
+       *     时 `load()` 直接 return），只能读 RemoteScope 自己 describe 出来
+       *     的那一份。
+       *
+       * 注意自建 scope 的 mutate 回答里 Host 会带上 `secrets`，所以保存之后
+       * 侧信道也是新的，不会停在旧值上。
+       *
+       * @returns {object|undefined} `{ writable, namespaces }`
+       */
+      describeView() {
+        if (this.ownScope !== undefined) {
+          const snapshot = this.ownScope.getSnapshot();
+          const row = snapshot.status === "ready"
+            ? {
+                ns: NS,
+                value: snapshot.value,
+                base: snapshot.base,
+                user: snapshot.user,
+                revision: snapshot.revision,
+                secrets: snapshot.secrets,
+              }
+            : undefined;
+          return row === undefined ? undefined : { writable: snapshot.writable, namespaces: [row] };
+        }
+        const forms = this.ctx.get?.("configForms");
+        if (forms === undefined) return undefined;
+        return forms.describe().getSnapshot().view;
+      }
+
       /** 插槽注册时注入的那副面孔。 */
       inject() {
         return {
@@ -907,9 +1203,10 @@ window.__ModuleLoader__.load({
       }
 
       dispose() {
-        this.unsubscribeMirror();
-        this.unsubscribe();
+        this.unsubscribeMirror?.();
+        this.unsubscribe?.();
         this.form.dispose();
+        this.ownScope?.dispose();
       }
     }
 
@@ -978,11 +1275,68 @@ window.__ModuleLoader__.load({
       //     就绪时 cb 跑，没就绪就一直等；apply 本身照常执行，侧栏照常注册。
       //
       // 这正是软依赖该用的形态：把「等」的作用域收到最小。
+      //
+      // ## 第二层：宿主 scope 未必可用，未必因为我们
+      //
+      // 上面解决的是「configForms 到不了场」。还有一个更隐蔽的失败：它到场了、
+      // `get(NS)` 也返回了对象，但那个对象的 `status` **永远不会**变成 ready。
+      // 宿主的 `ConfigFormController` 在构造时按页面来源二选一：
+      //
+      //     const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";
+      //
+      // 只有 `localhost` / `[::1]` / `127.x.x.x` 算 loopback。用公网 IP 或域名
+      // 打开页面时走 memory 分支，而 memory 下 `status` 恒为 `"unavailable"`、
+      // 镜像永不加载、写入直接 return false —— 表现就是卡片上那句
+      // 「该插件当前未加载，暂时无法配置。」，尽管插件明明在跑。
+      //
+      // 所以控制器不只是「接收 scope」，它自己会判断这个 scope 值不值得用，
+      // 必要时换成只走 `remote.settings` 的自建 scope（见 RemoteScope）。
+      //
+      // ## 两级安装：先立即可用，再择机升级
+      //
+      // 不写成「等 configForms 就绪再建控制器」——那样在 loopback 上要白等一个
+      // 微任务周期，面板首帧会是空的。改成：
+      //
+      //   ① 立刻建（此时 configForms 通常还没到，自动落到 RemoteScope）
+      //   ② configForms 到场后，若它的 scope 可用，换成它重建
+      //
+      // ②只做「升级」，从不降级：一旦已经在用宿主 scope，就不会再被换回自建。
       let controller;
-      ctx.inject(["configForms"], (child) => {
+
+      /**
+       * 用当前可得的 scope 建（或升级）控制器。
+       *
+       * @param {object} scopeCtx 提供 configForms 的上下文
+       * @param {object} remote `ctx.remote`
+       */
+      const install = (scopeCtx, remote) => {
+        const forms = scopeCtx.get?.("configForms");
+        let hostScope;
+        try {
+          hostScope = forms?.get?.(NS);
+        } catch {
+          hostScope = undefined;
+        }
+
+        const upgrade = hostScope !== undefined && isScopeServable(hostScope);
+        // 已经在用可用的宿主 scope 时不重建，否则每次 setup 都会重发 describe
+        if (controller !== undefined && !upgrade) return;
+
+        controller?.dispose();
+        controller = new MemoryCardController(scopeCtx, remote, upgrade ? hostScope : undefined);
+      };
+
+      // ① 立即可用。`RemoteScope` 只依赖 `remote.settings`，那是个一直挂着的
+      //    服务，所以这一步在 loopback 与非 loopback 上都能成。
+      //
+      //    `remote` 用 ctx.inject 取，不写进顶层 inject —— 它缺席时插件仍要
+      //    能注册侧栏（哪怕是降级态），不该被硬门禁挡住整个 apply。
+      ctx.inject(["remote"], (child) => {
         child.effect(() => {
+          const remote = child.remote;
+          if (controller !== undefined) return () => {};
           try {
-            controller = new MemoryCardController(child, child.configForms.get(NS));
+            install(child, remote);
           } catch (error) {
             child.logger?.warn?.(error);
             controller = undefined;
@@ -992,6 +1346,21 @@ window.__ModuleLoader__.load({
             controller = undefined;
           };
         }, "memory-hybrid: form");
+      });
+
+      // ② 择机升级到宿主 scope（它的镜像与其他设置页共享，外部改动会跟着刷新）。
+      //    用 ctx.inject 而不是把 configForms 写进顶层 inject，理由同上：
+      //    configForms 缺席时这里安静不跑，而 ① 已经把面板撑起来了。
+      ctx.inject(["configForms", "remote"], (child) => {
+        child.effect(() => {
+          if (controller !== undefined) return () => {};
+          try {
+            install(child, child.remote);
+          } catch (error) {
+            child.logger?.warn?.(error);
+          }
+          return () => {};
+        }, "memory-hybrid: form upgrade");
       });
 
       // 传给页面的那一副面孔；控制器没建起来时给空 hooks，
@@ -1009,37 +1378,78 @@ window.__ModuleLoader__.load({
       const slot = (name, options, component) =>
         ctx.slots.inject(name, () => ctx.slots.register({ name, ...options }, component));
 
+      /** 设置页 tab 的注册参数，两路注册共用同一份。 */
+      const tabOptions = {
+        name: "settings.plugins.tab",
+        id: "memory-hybrid",
+        order: 20,
+        label: () => t("tab"),
+        locale: NS,
+        inject: props,
+      };
+
       /**
-       * 设置页 tab：只有 Host 真的把本命名空间放进 describe 镜像时才注册。
+       * 设置页 tab：正常情况下等 Host 真的把本命名空间放进 describe 镜像再注册。
        *
-       * 这一处**确实**需要守卫 —— tab 里是可编辑表单，命名空间不可写时露出
-       * 页面只会让人白填一遍。侧栏面板不能用同样的守卫，理由见下面 page 那段
-       * 注释。
+       * `whileServed` 的用意是「这个部署压根没组这个命名空间时，别露出一个
+       * 空页面」。但它依赖 describe 镜像 —— 而非 loopback 页面下镜像**永不
+       * 加载**（`SettingsDescribeMirror.load()` 在 `persistence === "memory"`
+       * 时直接 return），于是 `served` 恒为空集，tab 也永不注册。
        *
-       * configForms 不到场时这两层（ctx.inject + whileServed）都会安静地等，
-       * 且**只影响这一个 tab**：它不参与下面 ctx.effect 的 offs 数组，
-       * 所以侧栏与主面板不因它缺席而受影响。这是本文件与上一版最大的区别。
+       * 所以这里分两路：
+       *
+       *   · 宿主 scope 可用（loopback）—— 保留 whileServed，尊重它的原意
+       *   · 宿主 scope 不可用（非 loopback）—— 改为直接用自建 scope 探一次：
+       *     能读到本命名空间就注册，读不到就不注册。判据与 whileServed 等价
+       *     （都是「Host 在服务这个 ns 吗」），只是数据源换成 RPC。
+       *
+       * 无论哪一路，都只影响这一个 tab，不影响下面的侧栏与主面板。
        */
       ctx.inject(["configForms"], (child) => {
-        child.effect(
-          () =>
-            child.configForms.whileServed([NS], () =>
-              child.slots.inject("settings.plugins.tab", () =>
-                child.slots.register(
-                  {
-                    name: "settings.plugins.tab",
-                    id: "memory-hybrid",
-                    order: 20,
-                    label: () => t("tab"),
-                    locale: NS,
-                    inject: props,
-                  },
-                  MemoryCard,
-                ),
+        const hostScope = (() => {
+          try {
+            return child.configForms.get(NS);
+          } catch {
+            return undefined;
+          }
+        })();
+
+        if (hostScope !== undefined && isScopeServable(hostScope)) {
+          child.effect(
+            () =>
+              child.configForms.whileServed([NS], () =>
+                child.slots.inject("settings.plugins.tab", () => child.slots.register(tabOptions, MemoryCard)),
               ),
-            ),
-          "memory-hybrid: tab",
-        );
+            "memory-hybrid: tab",
+          );
+          return;
+        }
+
+        // 非 loopback：用 RPC 自己确认一次命名空间是否被服务。
+        child.inject(["remote"], (grand) => {
+          grand.effect(
+            () => {
+              const probe = new RemoteScope(grand, NS, grand.remote);
+              let off;
+              const stop = probe.subscribe(() => {
+                const snapshot = probe.getSnapshot();
+                if (snapshot.status === "loading") return;
+                if (snapshot.status === "ready" && off === undefined) {
+                  off = grand.slots.inject("settings.plugins.tab", () =>
+                    grand.slots.register(tabOptions, MemoryCard),
+                  );
+                }
+              });
+              return () => {
+                stop();
+                off?.();
+                off = undefined;
+                probe.dispose();
+              };
+            },
+            "memory-hybrid: tab (remote probe)",
+          );
+        });
       });
 
       // 侧栏图标与主面板：无条件注册。
@@ -1105,6 +1515,16 @@ window.__ModuleLoader__.load({
     exports.PANEL_ID = PANEL_ID;
     exports.apply = apply;
     exports.inject = inject;
+
+    // 下面两个不是给宿主用的，是给测试与排障用的。
+    //
+    // `isScopeServable` 是「宿主 scope 还能不能用」的判据本身 —— 这个 bug
+    // （「该插件当前未加载」）唯一的表征就是它返回 false，所以值得单独可测。
+    // `RemoteScope` 同理：它是绕开宿主 memory 分支的那条路，需要一个能直接
+    // 断言 `status` 落在 ready 的入口。
+    exports.isScopeServable = isScopeServable;
+    exports.RemoteScope = RemoteScope;
+
     return module.exports;
   },
 });

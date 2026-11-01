@@ -642,6 +642,158 @@ get(name, strict = true) {
 
 **判据**：问自己「这个服务缺席时，插件还有没有价值？」有 → 软依赖，用 `ctx.inject` 或 `ctx.get`；没有 → 硬依赖，进顶层 `inject`。侧栏属于「有」。
 
+#### 事故三：侧栏出现了，面板却写「该插件当前未加载」
+
+0.2.2 之后侧栏入口终于出现，但点进去主面板只有一句：
+
+> 长期记忆
+> 分级 · 衰减 · 唤醒 · 淘汰
+> **该插件当前未加载，暂时无法配置。**
+> 也可在 设置 → 插件 → 记忆 中修改同一份配置
+
+这四行里，标题、副标题、脚注都是 `MemoryPanelPage` 自己画的 —— 它们正常渲染，说明**插件在跑、组件树在跑**。只有中间那句来自 `SettingsForm` 的 `labels.unavailable` 分支：
+
+```js
+function SettingsForm(props) {
+  const { state, labels } = props;
+  if (!state.available) return jsx("p", { ... children: labels.unavailable });
+```
+
+而 `state.available` 的来源是（`dsh-client-ui-primitives/lib/index.js:7190`）：
+
+```js
+shell() {
+  const snapshot = this.scope.getSnapshot();
+  return { available: snapshot.status === "ready", ... };
+}
+```
+
+所以问题收敛成一件事：**`scope.getSnapshot().status` 为什么永远不是 `"ready"`**。
+
+##### 根因：宿主按页面来源关掉了整个表单
+
+`dsh-client-ui-settings/lib/client.js:1509`：
+
+```js
+const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";
+```
+
+`isLoopback` 的判据在 `dsh-client-connection/lib/client.js:1333`：
+
+```js
+function isLoopbackHostname(hostname) {
+  if (hostname === "localhost" || hostname === "[::1]") return true;
+  const parts = hostname.split(".");
+  return parts.length === 4 && parts[0] === "127" && ...;
+}
+```
+
+**只认 `localhost` / `[::1]` / `127.x.x.x`。** 用公网 IP 或域名打开页面时它是 `false`，于是 `persistence = "memory"`，而 memory 分支下三件事同时发生：
+
+```js
+// 1118 行 —— 一经构造就是终态，永远不会变
+status: persistence === "host" ? "loading" : "unavailable",
+// 1407 行 —— 镜像永不加载
+load()   { if (this.persistence === "memory") return Promise.resolve(); }
+// 1423 行
+ensure() { if (this.persistence === "memory") return Promise.resolve(); }
+// 1213 行 —— 写入一律直接失败，连请求都不发
+enqueue(operation) { if (this.persistence === "memory" || this.disposed) return Promise.resolve(false); }
+```
+
+于是 `status` 恒为 `"unavailable"`、`available` 恒为 `false`、界面恒为「该插件当前未加载」。**与插件无关，也不是「没加载」** —— 宿主的措辞在非 loopback 场景下是误导性的。
+
+同一个限制也解释了为什么设置页 tab 同样不出现：`whileServed` 读的是那个永不加载的镜像，`served` 恒为空集。
+
+##### 先确认 Host 侧是好的，再动手
+
+排查时一度怀疑 Host 端 `src/index.js` 的 `inject` 里硬写着 `storageDomain` 会造成 pending。注意 `cordis.patch.yml` 的注释里正记着这个先例：「patch 里写着 storageDomain，模块已改成软探测，结果插件永远不启动」。两条信息矛盾，必须实测。
+
+在服务器上临时给 `apply` 注入一段诊断后重启，得到：
+
+```
+[DIAG] rows= 20
+[DIAG] ns= ...,ui-chat,agent-preset-registry,dsh-memory-hybrid
+[DIAG] hit= true
+[DIAG] secrets= [{"path":["jevApiKey"],"set":false},{"path":["embedApiKey"],"set":false}]
+[DIAG] fiber.state= 2
+[DIAG] writable= true
+```
+
+四条结论：`fiber.state === 2`（已挂载，`apply` 真的执行了）、`describe()` 里有本命名空间、密钥侧信道正常、`writable === true`。**Host 侧完全健康**，`storageDomain` 那条是误判 —— 该服务由 `dsh-storage-domain/lib/index.js:450` 正常 `provide`，不应改动。
+
+这一步的价值：如果没有这份证据，很容易去改一个没坏的地方，然后被「改了还是不行」拖进更深的误判。
+
+##### 修法：自备 scope，只走 `remote.settings`
+
+Host 端的 `dsh-api-settings-controller` 对 `describe` / `mutate` **没有任何 loopback 门禁**（`--trusted-host` 只管 `/api` 的请求准入，见 `dsh-client-connection/lib/index.js:210`）。RPC 是通的，被挡住的只是前端那层保守策略。
+
+而 `SettingsFormModel` 对 scope 的要求其实很窄 —— 只有三个方法：
+
+| 方法 | 用途 |
+|---|---|
+| `getSnapshot()` | 读 `{status, value, base, user, revision, writable}` |
+| `subscribe(fn)` | 快照变化通知 |
+| `mutate(ops, expectedRevision)` | 写入 |
+
+所以本插件自带一个 `RemoteScope` 满足这份契约，数据源直接是 `ctx.remote.settings`。控制器按需在两者间选择：
+
+```js
+const upgrade = hostScope !== undefined && isScopeServable(hostScope);
+controller = new MemoryCardController(ctx, remote, upgrade ? hostScope : undefined);
+```
+
+判据 `isScopeServable` 只看一件事 —— 这个 scope 有没有可能变成 ready：
+
+```js
+function isScopeServable(scope) {
+  const snapshot = scope.getSnapshot();
+  if (snapshot.status === "ready") return true;
+  // 非 ready 时唯一的死刑判决是 memory 持久化；loading/idle 都还在路上
+  return snapshot.mode !== "memory";
+}
+```
+
+`mode` 是宿主 `ConfigFormController` 自己写进快照的字段（值就是 `persistence`），拿它当判据比猜时序可靠。**注意必须区分「现在不是 ready 且永远不会变」与「现在 loading 但马上会好」** —— 否则正常 loopback 部署也会被误换成自建 scope。
+
+安装分两级，先立即可用再择机升级：
+
+```js
+// ① 立即可用：只依赖 remote，loopback 与非 loopback 都能成
+ctx.inject(["remote"], (child) => {
+  child.effect(() => { install(child, child.remote); ... }, "memory-hybrid: form");
+});
+
+// ② 择机升级到宿主 scope（它的镜像与其他设置页共享，外部改动会跟着刷新）
+ctx.inject(["configForms", "remote"], (child) => {
+  child.effect(() => { install(child, child.remote); ... }, "memory-hybrid: form upgrade");
+});
+```
+
+`install` 内部只做升级、从不降级：已经在用可用的宿主 scope 就直接返回，避免每次 setup 重发 describe。
+
+设置页 tab 同理分两路：loopback 下保留 `whileServed`（尊重它「别露出空页面」的原意），非 loopback 下改用 `RemoteScope` 自己探一次 —— 判据与 `whileServed` 等价（都是「Host 在服务这个 ns 吗」），只是数据源换成 RPC。
+
+##### 一个连带的时序 bug
+
+`RemoteScope` 的 `load()` 在构造函数里就发起，而订阅往往晚于它落地。若 `subscribe` 只登记监听、不立即回调，那次状态变化就**永远收不到** —— 表现是 tab 探测静默不注册。所以 `subscribe` 里要主动回调一次：
+
+```js
+subscribe(listener) {
+  this.listeners.add(listener);
+  try { listener(); } catch {}     // ← 订阅时立即回调
+  return () => this.listeners.delete(listener);
+}
+```
+
+这与 `useSyncExternalStore` 的语义也一致：订阅方拿到的是「当前状态」，不是「下一次变化」。
+
+##### 这个 bug 的教训
+
+诊断「某块 UI 没出现」时，先把界面上的每一行文字对回代码里的渲染点。这次那四行字精确地把失败点钉在 `SettingsForm` 的 `if (!state.available)` 上 —— 省掉了「侧栏没出现 → 是不是插件没加载 → 是不是 inject 有问题」那一整圈弯路。
+
+另外：**宿主没报错不代表宿主没拒绝你**。`memory` 分支是 `return Promise.resolve(false)`，静默返回失败，连 console 都不打。这类「安静地拒绝」只能靠读源码定位，看日志是看不出来的。
+
 #### 另一个静默坑：`dsh.client.inject` 写错不会有任何提示
 
 `package.json` 的 `dsh.client.inject` 只能列**真实存在、且该包自己声明了 `dsh.client`** 的模块。写错的表现同样是完全静默：
@@ -1151,7 +1303,7 @@ cd <工作区根>          # 与 plugin/ 同级的那一层
 node test/run-all.mjs
 ```
 
-七个套件共 455 项：
+七个套件共 472 项：
 
 | 套件 | 项数 | 覆盖 |
 |---|---|---|
@@ -1160,7 +1312,7 @@ node test/run-all.mjs
 | `sqlite-embedded.test.mjs` | 38 | 内嵌引擎、持久化、损坏自愈 |
 | `embed-config.test.mjs` | 83 | 嵌入配置继承、断言、设置页控件匹配 |
 | `host-wiring.test.mjs` | 33 | 真实 cordis + storage + domain 装配 |
-| `sidebar-panel.test.mjs` | 44 | 侧栏两处插槽注册 + 软依赖降级（真实执行 `apply()`） |
+| `sidebar-panel.test.mjs` | 58 | 侧栏两处插槽注册 + 软依赖降级 + 非 loopback 自立（真实执行 `apply()`） |
 | `manifest.test.mjs` | 40 | 两份清单一致、inject 白名单、版本是否跟上源码 |
 
 `host-wiring` 用的是宿主真实的 `Storage` / `DomainFacility`，

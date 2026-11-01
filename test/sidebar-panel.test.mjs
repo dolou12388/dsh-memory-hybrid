@@ -137,11 +137,61 @@ function loadClient() {
  * @param {boolean} [options.withConfigForms] 初始就提供 configForms
  * @returns {object} { ctx, registrations, state }
  */
+/**
+ * `ctx.remote` 的最小桩：只实现本插件用到的那两个 RPC。
+ *
+ * `describe` 回一份含本命名空间的文档，`mutate` 回写后的视图 —— 与
+ * `dsh-api-settings-controller` 的真实回答结构一致
+ * （`{writable, hasDocument, namespaces:[...]}` / 单个 namespaceView）。
+ *
+ * 放在 makeCtx 外面是因为「非 loopback」那组测试要直接把它喂给 RemoteScope，
+ * 不经过 apply()。
+ *
+ * @param {object} [options]
+ * @param {string} [options.status] 让 describe 回 ok:false 以模拟通道故障
+ * @returns {object} { settings: { describe, mutate } }
+ */
+function makeRemote({ status = "ok" } = {}) {
+  return {
+    settings: {
+      describe: async () => {
+        if (status === "fail") return { ok: false, error: { message: "boom" } };
+        return {
+          ok: true,
+          value: {
+            writable: true,
+            hasDocument: true,
+            namespaces: [
+              {
+                ns: "dsh-memory-hybrid",
+                value: { recallLimit: 6 },
+                base: {},
+                user: {},
+                revision: 1,
+                secrets: [{ path: ["embedApiKey"], set: false }],
+              },
+            ],
+          },
+        };
+      },
+      mutate: async () => ({
+        ok: true,
+        value: {
+          ns: "dsh-memory-hybrid",
+          value: { recallLimit: 6 },
+          base: {},
+          revision: 2,
+          secrets: [{ path: ["embedApiKey"], set: false }],
+        },
+      }),
+    },
+  };
+}
+
 function makeCtx({ withConfigForms = true } = {}) {
   const registrations = [];
   const state = {
-    whileServedDisposer: undefined,
-    whileServedRan: false,
+    whileServedDisposer: undefined,whileServedRan: false,
     effects: 0,
     /** 已提供但尚未抵达 inject 回调的条件 */
     pending: [],
@@ -189,8 +239,10 @@ function makeCtx({ withConfigForms = true } = {}) {
     },
   };
 
-  const services = { slots, locale: {}, configForms };
+  const services = { slots, locale: {}, configForms, remote: makeRemote() };
   if (withConfigForms) state.provided.add("configForms");
+  // remote 是宿主的基础服务，真实部署里始终在场；本插件只把它当软依赖读
+  state.provided.add("remote");
 
   /**
    * 把 ctx 变成「已提供某服务」的 child。
@@ -208,7 +260,10 @@ function makeCtx({ withConfigForms = true } = {}) {
       get: parent.get,
     };
     for (const name of names) {
-      child[name] = state.overrideConfigForms ?? services[name];
+      // overrideConfigForms 只顶替 configForms，不能污染 remote 等其它服务
+      child[name] = name === "configForms"
+        ? (state.overrideConfigForms ?? services[name])
+        : services[name];
     }
     return child;
   };
@@ -413,7 +468,8 @@ if (client !== undefined) {
     ok("侧栏图标必须注册（这是左侧入口）", hasIcon);
     ok("主面板必须注册", hasPage);
     ok("设置页 tab 不注册", hasTab === false);
-    // 控制器与 tab 各有一个 ctx.inject，configForms 缺席时两个都该在等
+    // 两个 ctx.inject 在等：tab（configForms）与升级（configForms+remote）。
+    // 控制器那一个等的是 remote，而 remote 始终在场，所以不会挂起。
     ok(
       "configForms 的就绪回调被挂起等待",
       soft.state.pending.length === 2,
@@ -426,6 +482,98 @@ if (client !== undefined) {
     const iconStill = soft.registrations.some((row) => row.options.name === "sidebar.panellist");
     ok("configForms 迟到后 tab 补注册", tabLater);
     ok("侧栏图标始终在", iconStill);
+  }
+
+  group("\n非 loopback 页面：宿主 scope 永不就绪时必须自立");
+
+  // 这是 0.2.3 修的那个 bug 的回归位。
+  //
+  // 用公网 IP / 域名打开页面时，宿主的 ConfigFormController 拿到
+  // `persistence = "memory"`，其 status 恒为 "unavailable" 且永不订阅镜像，
+  // 于是 SettingsFormModel.shell() 的 `available` 永远 false，卡片稳定显示
+  // 「该插件当前未加载，暂时无法配置。」—— 但插件明明在跑。
+  //
+  // 修法：控制器发现宿主 scope 的 mode 是 "memory" 时，换成自建的
+  // RemoteScope（只走 remote.settings）。
+  {
+    const memoryScope = {
+      getSnapshot: () => ({
+        status: "unavailable",
+        value: undefined,
+        revision: undefined,
+        writable: false,
+        mode: "memory",
+      }),
+      mutate: async () => false,
+      subscribe: () => () => {},
+    };
+
+    // 直接验判据：memory 判死，其余放行
+    ok(
+      "mode=memory 的宿主 scope 判定为不可用",
+      client.isScopeServable(memoryScope) === false,
+    );
+    ok(
+      "status=ready 的宿主 scope 判定为可用",
+      client.isScopeServable({ getSnapshot: () => ({ status: "ready", mode: "host" }) }) === true,
+    );
+    ok(
+      "status=loading 且 mode=host 仍在路上，不判死",
+      client.isScopeServable({ getSnapshot: () => ({ status: "loading", mode: "host" }) }) === true,
+    );
+    ok(
+      "getSnapshot 抛错的 scope 判定为不可用",
+      client.isScopeServable({ getSnapshot: () => { throw new Error("boom"); } }) === false,
+    );
+
+    // 端到端：自建 scope 能从 Host 读到本命名空间并落到 ready
+    const scope = new client.RemoteScope({ logger: {} }, client.NS, makeRemote());
+    ok("自建 scope 的 mode 是 remote", scope.getSnapshot().mode === "remote");
+    ok("自建 scope 初始为 loading", scope.getSnapshot().status === "loading");
+
+    // describe 是异步的，等它落地
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const after = scope.getSnapshot();
+    ok("describe 落地后 status=ready", after.status === "ready", `实际 ${after.status}`);
+    ok("status=ready 正是 SettingsFormModel.shell() 判 available 的条件", after.status === "ready");
+    ok("读到了 value", after.value?.recallLimit === 6);
+    ok("writable 跟随 Host", after.writable === true);
+
+    // 变更要通知订阅者，否则界面不会重绘
+    let notified = 0;
+    scope.subscribe(() => { notified += 1; });   // 订阅本身会立即回调一次
+    ok("订阅时立即回调一次（这是 tab 探测能成立的前提）", notified === 1, `实际 ${notified}`);
+    await scope.load();
+    ok("重新 load 再通知一次", notified === 2, `实际 ${notified}`);
+
+    scope.dispose();
+  }
+
+  group("\n非 loopback：设置页 tab 靠 RPC 探测补上");
+
+  // whileServed 依赖 describe 镜像，而镜像在 memory 下永不加载 —— 若不换路，
+  // tab 在公网访问时也不会出现。这一组验证「换成 RPC 探测」这条路真的注册了。
+  {
+    const mem = makeCtx();
+    const cfg = { ...mem.ctx.get("configForms") };
+    // 宿主 scope 永远 unavailable + memory
+    cfg.get = () => ({
+      getSnapshot: () => ({ status: "unavailable", writable: false, mode: "memory" }),
+      mutate: async () => false,
+      subscribe: () => () => {},
+    });
+    // whileServed 永不触发，模拟镜像不加载
+    cfg.whileServed = () => () => {};
+    mem.state.overrideConfigForms = cfg;
+
+    client.apply(mem.ctx);
+    // RPC 探测是异步的，等它落地
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const hasTab = mem.registrations.some((row) => row.options.name === "settings.plugins.tab");
+    const hasIcon = mem.registrations.some((row) => row.options.name === "sidebar.panellist");
+    ok("memory 下 tab 通过 RPC 探测注册成功", hasTab, "未注册说明探测路径没跑通");
+    ok("sidebar 不受影响", hasIcon);
   }
 
   group("\n注入面");

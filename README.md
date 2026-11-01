@@ -64,6 +64,11 @@ dsh-memory/
 
 ```bash
 # 1. 装（bundles 会自动登记，不用手改 package.json）
+
+# 从 GitHub 直接装（任意目录执行，不依赖本地仓库）
+dsh plugin --profile <你的 profile> add "github:dolou12388/dsh-memory-hybrid"
+
+# 或用本地源码目录（改代码即时生效）
 dsh plugin --profile <你的 profile> add "link:<本目录>/plugin"
 
 # 2. 确认配置里出现了条目
@@ -74,6 +79,14 @@ dsh --profile <你的 profile> --dump-config | grep memory-hybrid
 #    memory: domain opened name=memory_hybrid via=sqlite memories=N
 #    memory: ready (dim=256, autoRecall=true)
 ```
+
+两种方式都装同一个包，装完都落在 `node_modules/dsh-memory-hybrid`，
+入口统一为包根的 `plugin/src/index.js`。区别只有更新时机：
+`github:` 跟到某个 commit，升级要重新 `add`；`link:` 直接读工作区，改完重启即可。
+
+> 仓库根的 `package.json` 是**代理清单**，只把入口与 `dsh.bundle.patch` 指到
+> `plugin/` 子目录，源文件一个都没搬。这是 `github:` 能装的前提 —— 没有它，
+> pnpm 读不到清单会合成一个空占位包，dsh 报 `declares no dsh.bundle`。
 
 装完后库文件在 `~/.dsh/storages/memory_hybrid.sqlite`。
 

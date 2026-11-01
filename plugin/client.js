@@ -955,62 +955,84 @@ window.__ModuleLoader__.load({
       const slot = (name, options, component) =>
         ctx.slots.inject(name, () => ctx.slots.register({ name, ...options }, component));
 
-      // whileServed：只有宿主真的提供了本命名空间才注册页面。
-      // 少了这层守卫，命名空间没被服务时页面上会出现一个永远空白的 tab。
+      /**
+       * 设置页 tab：只有 Host 真的把本命名空间放进 describe 镜像时才注册。
+       *
+       * 这一处**确实**需要守卫 —— tab 里是可编辑表单，命名空间不可写时露出
+       * 页面只会让人白填一遍。侧栏面板不能用同样的守卫，理由见下面 page 那段
+       * 注释。
+       */
+      const guardedTab = () =>
+        ctx.configForms.whileServed([NS], () =>
+          slot(
+            "settings.plugins.tab",
+            {
+              id: "memory-hybrid",
+              order: 20,
+              label: () => t("tab"),
+              locale: NS,
+              inject: props,
+            },
+            MemoryCard,
+          ),
+        );
+
+      // 侧栏图标与主面板：无条件注册。
       //
-      // 三处注册要一起收口，但 whileServed 只认一个返回值，所以把三个
-      // disposer 合成一个：任一撤销都走同一条路径，避免只撤一半。
+      // 早期版本把这两处也包在 `ctx.configForms.whileServed([NS], ...)` 里，
+      // 结果是**侧栏图标根本不出现**。原因：whileServed 的语义是「等 Host 把
+      // 这个设置命名空间放进 describe 镜像」才执行回调 —— 它守护的是「配置
+      // 页面」，而不是「侧栏面板」。两者依赖的东西完全不同：
+      //
+      //   · 设置页 tab  —— 确实需要命名空间可写，否则用户改了存不进去
+      //   · 侧栏面板   —— 只需要 slots 服务；侧栏本身不关心配置是否可写
+      //
+      // 而且 whileServed 是**静默**不触发的：命名空间没被服务时它只是不调用
+      // 回调，不报任何错。于是整个插件的 UI 全都不出现，日志里干干净净。
+      // 这正是「装了插件但左侧没入口」的直接原因。
+      //
+      // 正确的分工：设置页 tab 继续跟随命名空间（它真的依赖），侧栏两处
+      // 直接注册（不依赖）。三处仍各自持有 disposer，交给 ctx.effect 统一收口。
       ctx.effect(
-        () =>
-          ctx.configForms.whileServed([NS], () => {
-            const offs = [
-              // ① 设置页 tab（原有入口，保留）
-              slot(
-                "settings.plugins.tab",
-                {
-                  id: "memory-hybrid",
-                  order: 20,
-                  label: () => t("tab"),
-                  locale: NS,
-                  inject: props,
-                },
-                MemoryCard,
-              ),
+        () => {
+          const offs = [
+            // ① 设置页 tab：跟随命名空间，命名空间不可写时不该露出页面
+            guardedTab(),
 
-              // ② 侧栏图标：点击后由宿主调 layout.selectPanel(PANEL_ID)
-              slot(
-                "sidebar.panellist",
-                {
-                  id: PANEL_ID,
-                  order: PANEL_ORDER,
-                  locale: NS,
-                  label: () => t("panel"),
-                },
-                MemoryIcon,
-              ),
+            // ② 侧栏图标：点击后由宿主调 layout.selectPanel(PANEL_ID)
+            slot(
+              "sidebar.panellist",
+              {
+                id: PANEL_ID,
+                order: PANEL_ORDER,
+                locale: NS,
+                label: () => t("panel"),
+              },
+              MemoryIcon,
+            ),
 
-              // ③ 主面板：keyed slot，key 必须与侧栏 id 相同
-              slot(
-                "main",
-                {
-                  key: PANEL_ID,
-                  locale: NS,
-                  inject: props,
-                },
-                MemoryPanelPage,
-              ),
-            ];
+            // ③ 主面板：keyed slot，key 必须与侧栏 id 相同
+            slot(
+              "main",
+              {
+                key: PANEL_ID,
+                locale: NS,
+                inject: props,
+              },
+              MemoryPanelPage,
+            ),
+          ];
 
-            return () => {
-              for (const off of offs) {
-                try {
-                  off?.();
-                } catch {
-                  // 某一处已自行撤销时不应连累其余，逐个吞掉继续。
-                }
+          return () => {
+            for (const off of offs) {
+              try {
+                off?.();
+              } catch {
+                // 某一处已自行撤销时不应连累其余，逐个吞掉继续。
               }
-            };
-          }),
+            }
+          };
+        },
         "memory-hybrid: page",
       );
     }

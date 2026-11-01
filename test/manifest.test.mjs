@@ -108,6 +108,45 @@ eq("子包 bundle patch", pluginPkg.dsh?.bundle?.patch, "./cordis.patch.yml");
 eq("根清单 client.platform", rootPkg.dsh?.client?.platform, "web");
 eq("根清单 client.inject", rootPkg.dsh?.client?.inject, pluginPkg.dsh?.client?.inject);
 
+/*
+ * inject 里只能列真实存在、且宿主会作为独立客户端模块送出的包。
+ *
+ * 这里踩过两次：
+ *   · `@deepseek-ai/dsh-client-ui-locale` —— 名字根本不存在（正确是
+ *     `dsh-client-locale`，没有 ui 段）。写错不会报错，只是永远匹配不上。
+ *   · `@deepseek-ai/dsh-client-ui-slots` —— 包存在，但它没有 `dsh.client`
+ *     声明，属于服务端库，不是可注入的客户端模块。
+ *
+ * 两者都是静默的：inject 解析不到依赖时 client-modules 直接跳过，
+ * 不抛错，于是插件照常加载、apply 照常跑 —— 只有真正的功能不出来。
+ */
+const CLIENT_INJECT = rootPkg.dsh?.client?.inject ?? [];
+
+const KNOWN_CLIENT_MODULES = new Set([
+  "@deepseek-ai/dsh-client-ui-primitives",
+  "@deepseek-ai/dsh-client-ui-settings",
+  "@deepseek-ai/dsh-client-locale",
+  "@deepseek-ai/dsh-client-ui-layout",
+  "@deepseek-ai/dsh-client-ui-sidebar",
+]);
+
+for (const spec of CLIENT_INJECT) {
+  ok(
+    `client.inject 项 ${spec} 是已知客户端模块`,
+    KNOWN_CLIENT_MODULES.has(spec),
+    "不在白名单里 —— 确认包名拼写，以及该包是否声明了 dsh.client",
+  );
+}
+
+ok(
+  "client.inject 不含 ui-slots（它是服务端库，没有 dsh.client）",
+  !CLIENT_INJECT.includes("@deepseek-ai/dsh-client-ui-slots"),
+);
+ok(
+  "client.inject 不含 ui-locale（该包不存在，正确名是 dsh-client-locale）",
+  !CLIENT_INJECT.includes("@deepseek-ai/dsh-client-ui-locale"),
+);
+
 // files 白名单漏项会让 npm pack 少带文件，但本地 link 装看不出来
 const rootFiles = rootPkg.files ?? [];
 for (const expect of ["plugin/src", "plugin/client.js", "plugin/vendor", "plugin/cordis.patch.yml"]) {

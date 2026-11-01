@@ -35,7 +35,7 @@
 dsh-memory/
 ├── plugin/                    插件包（可 npm pack 分发）
 │   ├── src/                   16 个模块，4,314 行
-│   ├── client.js              浏览器端：设置页 tab + 侧栏面板（1,024 行）
+│   ├── client.js              浏览器端：设置页 tab + 侧栏面板（1,046 行）
 │   ├── vendor/sqlite/         内嵌 SQLite wasm 引擎（零外部依赖的关键）
 │   ├── cordis.patch.yml       bundle 补丁，声明插件默认配置
 │   ├── package.json           dsh.bundle.patch 指向上面那个 yml
@@ -155,8 +155,8 @@ backend-contract    48 项    存储后端契约
 sqlite-embedded     38 项    内嵌引擎 / 持久化 / 损坏自愈
 embed-config        83 项    嵌入配置继承 / 断言 / 设置页控件匹配
 host-wiring         33 项    真实 cordis + storage + domain 装配
-sidebar-panel       27 项    侧栏三处插槽注册（真实执行 apply）
-manifest            35 项    两份清单一致 / 版本是否跟上源码改动
+sidebar-panel       34 项    侧栏三处插槽注册（真实执行 apply）
+manifest            40 项    两份清单一致 / 版本跟上 / inject 合法
 ```
 
 `host-wiring` 用的是宿主真实服务而非 mock —— 装配时序问题只有真 cordis 才复现得出。

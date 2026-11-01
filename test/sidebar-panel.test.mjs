@@ -261,15 +261,51 @@ if (client !== undefined) {
 
   group("\n收口");
 
-  // whileServed 只认一个返回值；三个注册必须合成为一个可调用的 disposer，
-  // 否则命名空间撤走时注册会残留。
+  // 关键结构：设置页 tab 走 whileServed（真的依赖命名空间可写），
+  // 侧栏两处无条件注册（侧栏不关心配置能否写）。早期版本把三处全包进
+  // whileServed，命名空间未被服务时整个 UI 都不出现 —— 这就是「装了插件
+  // 但左侧没入口」的根因。
   eq("whileServed 回调返回了函数", typeof state.whileServedDisposer, "function");
 
   const before = registrations.length;
-  ok("撤销前有注册项", before === 3, `实际 ${before}`);
+  ok("撤销前有 3 个注册项", before === 3, `实际 ${before}`);
 
   state.whileServedDisposer?.();
-  eq("撤销后注册清空", registrations.length, 0);
+  // 撤掉 whileServed 只应收回 tab，侧栏两处仍在 —— 它们不受命名空间影响
+  eq("撤 tab 守卫后侧栏两处仍在", registrations.length, 2);
+
+  const stillIcon = registrations.find((row) => row.options.name === "sidebar.panellist");
+  const stillPage = registrations.find((row) => row.options.name === "main");
+  ok("侧栏图标未受影响", stillIcon !== undefined);
+  ok("主面板未受影响", stillPage !== undefined);
+  ok(
+    "设置页 tab 已被收回",
+    registrations.find((row) => row.options.name === "settings.plugins.tab") === undefined,
+  );
+
+  group("\n命名空间未被服务时侧栏仍要出现");
+
+  // 这是本次事故的回归点：whileServed 静默不触发（命名空间没被服务），
+  // 侧栏图标与主面板必须照旧注册，否则「左侧没入口」重演。
+  {
+    const bare = makeCtx();
+    // 把这个 ctx 的 whileServed 改成「永不触发」—— 模拟命名空间未被服务
+    bare.ctx.configForms.whileServed = (namespaces, register) => {
+      bare.state.whileServedRan = true;
+      bare.state.whileServedDisposer = undefined; // 回调根本没跑
+      return () => {};
+    };
+    client.apply(bare.ctx);
+
+    const hasIcon = bare.registrations.some((row) => row.options.name === "sidebar.panellist");
+    const hasPage = bare.registrations.some((row) => row.options.name === "main");
+    const hasTab = bare.registrations.some((row) => row.options.name === "settings.plugins.tab");
+
+    ok("whileServed 未触发", bare.state.whileServedRan === true);
+    ok("侧栏图标照样注册", hasIcon);
+    ok("主面板照样注册", hasPage);
+    ok("设置页 tab 被正确抑制（它确实依赖命名空间）", hasTab === false);
+  }
 
   group("\n注入面");
 

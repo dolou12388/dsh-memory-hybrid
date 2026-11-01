@@ -523,31 +523,71 @@ ctx.slots.inject("main", () =>
 
 `MemoryPanelPage` 只是一层壳：`main` 槽给的是个空盒子（`MainPanel` 直接 `renderSlot("main")`，不带内边距），而 `MemoryCard` 返回的 `SettingsForm` 是给设置页正文用的、不自带边距，直接塞进去会贴窗口边。所以外面包了 `padding: 28px 32px 48px` + `maxWidth: 720` 居中。
 
-### 三处注册怎么一起收口
+### 三处注册怎么收口 —— 以及为什么不能用同一个守卫
 
-设置页 tab、侧栏图标、主面板是**三次** `ctx.slots.inject`，但 `configForms.whileServed()` 只认**一个**返回值当 disposer。最初把三处写成独立语句、回调返回 `undefined`，结果是：命名空间一撤销，`whileServed` 拿不到任何东西可调，三个注册全残留在插槽里 —— 下次重新服务时会叠加出第二份。
-
-正确写法是让每处 `inject` 各自返回自己的 disposer，再合成一个：
+设置页 tab、侧栏图标、主面板是**三次** `ctx.slots.inject`。收口分两步：每处 `inject` 各自返回自己的 disposer，再合成一个交给 `ctx.effect`。
 
 ```js
 const slot = (name, options, component) =>
   ctx.slots.inject(name, () => ctx.slots.register({ name, ...options }, component));
 
-ctx.configForms.whileServed([NS], () => {
-  const offs = [
+// 设置页 tab 单独走 whileServed —— 它真的依赖命名空间可写
+const guardedTab = () =>
+  ctx.configForms.whileServed([NS], () =>
     slot("settings.plugins.tab", { id: "memory-hybrid", order: 20, ... }, MemoryCard),
-    slot("sidebar.panellist", { id: PANEL_ID, order: PANEL_ORDER, ... }, MemoryIcon),
-    slot("main", { key: PANEL_ID, ... }, MemoryPanelPage),
+  );
+
+ctx.effect(() => {
+  const offs = [
+    guardedTab(),                                        // ① 有守卫
+    slot("sidebar.panellist", { id: PANEL_ID, ... }, MemoryIcon),   // ② 无守卫
+    slot("main", { key: PANEL_ID, ... }, MemoryPanelPage),          // ③ 无守卫
   ];
   return () => {
     for (const off of offs) {
       try { off?.(); } catch {}
     }
   };
-});
+}, "memory-hybrid: page");
 ```
 
 `try/catch` 不是防御性冗余：三次 `register` 的返回类型由宿主决定，其中一个返回 `undefined` 时不该让另外两个漏掉。
+
+#### 事故：把三处都包进 whileServed，整个侧栏消失
+
+最初三处**全**包在 `ctx.configForms.whileServed([NS], ...)` 里，理由是「命名空间没被服务时不要露出空页面」。代价是：**侧栏图标根本不出现**。
+
+根因是 `whileServed` 的语义和它守护的对象不匹配：
+
+| | 依赖什么 | 该不该用 whileServed |
+|---|---|---|
+| 设置页 tab | 命名空间**可写**（表单要保存） | 该 —— 不可写时露出页面只是让人白填 |
+| 侧栏图标 / 主面板 | 只要 `slots` 服务在 | **不该** —— 侧栏不关心配置能否写 |
+
+更麻烦的是 `whileServed` **静默不触发**。宿主没把该命名空间放进 describe 镜像时，它只是不调用回调，不抛错、不打日志。于是：
+
+- 插件的 Host 端 `apply` 正常跑（记忆库照建、工具照注册）
+- 浏览器端 `apply` 也正常跑完
+- 但 `slot()` 一次都没被调用 → 侧栏没有图标，设置页没有 tab
+- 控制台干干净净
+
+用户看到的就是「装了插件但左侧没入口」，而日志里找不到任何线索。
+
+**判据**：需要命名空间里**可编辑的表单**才用 `whileServed`；纯粹展示、或只读 `slots` 的界面，直接注册。
+
+#### 另一个静默坑：`dsh.client.inject` 写错不会有任何提示
+
+`package.json` 的 `dsh.client.inject` 只能列**真实存在、且该包自己声明了 `dsh.client`** 的模块。写错的表现同样是完全静默：
+
+| 写法 | 问题 |
+|---|---|
+| `@deepseek-ai/dsh-client-ui-locale` | 包**不存在**。正确名是 `dsh-client-locale`，没有 `ui` 段 |
+| `@deepseek-ai/dsh-client-ui-slots` | 包存在，但 `dsh` 字段为 `null` —— 服务端库，不是可注入的客户端模块 |
+| `@deepseek-ai/dsh-client-ui-primitives` | 同样没有 `dsh.client`，但官方 `ui-schedule` 也这么写，实测可用 |
+
+`client-modules` 的解析逻辑是 `if (dependency !== void 0)` —— 在启动图里找不到就**跳过**，不报错。所以错的 inject 项不会阻断加载，只是白写一行。但 `require("@deepseek-ai/dsh-client-ui-locale")` 这种**真的去 require** 的错误就会直接抛 `missed the module table`，连带整个插件不加载。
+
+`test/manifest.test.mjs` 现在会校验 inject 里每一项都在已知客户端模块白名单内。
 
 ### 让它出现在设置页里，有三个必须同时满足的条件
 
@@ -1044,7 +1084,7 @@ cd <工作区根>          # 与 plugin/ 同级的那一层
 node test/run-all.mjs
 ```
 
-七个套件共 436 项：
+七个套件共 443 项：
 
 | 套件 | 项数 | 覆盖 |
 |---|---|---|

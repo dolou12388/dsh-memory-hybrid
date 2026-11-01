@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-hybrid",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "混合架构大模型记忆：KV 权威层 + 向量派生索引 + 艾宾浩斯衰减 + 可选 Jev 判别",
   "type": "module",
   "main": "src/index.js",
@@ -27,7 +27,6 @@
       "inject": [
         "@deepseek-ai/dsh-client-ui-primitives",
         "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-slots",
         "@deepseek-ai/dsh-client-locale"
       ],
       "platform": "web"

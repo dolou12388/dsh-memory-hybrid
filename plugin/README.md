@@ -179,6 +179,38 @@ ln -sfn <本包绝对路径> node_modules/dsh-memory-hybrid
 
 ⚠️ Windows 上 `ln -sfn` 会静默失败（`realpathSync` 报 ENOENT），必须用 Junction。
 
+### 升级：`github:` 装法不会跟进新提交
+
+装好之后再推新代码，重新执行同一条 `add "github:owner/repo"` **拿到的还是旧版本**，
+输出却照样显示 `+ dsh-memory-hybrid x.y.z`。
+
+根因是 pnpm 首次安装就把分支 HEAD 解析成具体 commit 钉进 lockfile：
+
+```yaml
+version: https://codeload.github.com/owner/repo/tar.gz/8e19f36dba...
+```
+
+此后 `pnpm add` 同一规格只比对包名与版本号，版本没变就跳过下载。而
+`dsh plugin add` 内部就是 `pnpm add`（`dsh-plugin-manager/lib/index.js`
+里 `runPnpm(["add", spec, ...])`），所以从 dsh 侧看不出任何异常。
+
+三种正确做法：
+
+```bash
+# ① 钉 commit（最稳）
+dsh plugin --profile <name> add "github:dolou12388/dsh-memory-hybrid#<sha>"
+
+# ② 摘掉再装
+dsh plugin --profile <name> remove dsh-memory-hybrid
+dsh plugin --profile <name> add "github:dolou12388/dsh-memory-hybrid"
+
+# ③ profile 目录里跑 update（只有它重新解析 git 依赖，add 不会）
+pnpm update dsh-memory-hybrid
+```
+
+因此**每次推新代码都要升 `package.json` 与 `plugin/package.json` 的版本号**，
+两份一起改。`test/manifest.test.mjs` 会在 `plugin/` 有改动而版本号未变时报失败。
+
 ### 补丁
 
 `cordis.patch.yml` 已随包提供：
@@ -1012,7 +1044,7 @@ cd <工作区根>          # 与 plugin/ 同级的那一层
 node test/run-all.mjs
 ```
 
-六个套件共 401 项：
+七个套件共 436 项：
 
 | 套件 | 项数 | 覆盖 |
 |---|---|---|
@@ -1022,6 +1054,7 @@ node test/run-all.mjs
 | `embed-config.test.mjs` | 83 | 嵌入配置继承、断言、设置页控件匹配 |
 | `host-wiring.test.mjs` | 33 | 真实 cordis + storage + domain 装配 |
 | `sidebar-panel.test.mjs` | 27 | 侧栏三处插槽注册（真实执行 `apply()`） |
+| `manifest.test.mjs` | 35 | 两份清单一致、版本是否跟上源码 |
 
 `host-wiring` 用的是宿主真实的 `Storage` / `DomainFacility`，
 不是 mock —— 装配时序这类问题只有真 cordis 才复现得出。

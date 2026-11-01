@@ -2,15 +2,17 @@
 /**
  * 全套测试入口。
  *
- * 六个套件按「依赖由少到多」排列，前面的失败不应掩盖后面的：
+ * 七个套件按「依赖由少到多」排列，前面的失败不应掩盖后面的：
  *   1. core            —— 纯逻辑，无 IO 无宿主
  *   2. backend-contract —— 存储契约，有 IO 无宿主
  *   3. sqlite-embedded  —— 内嵌引擎，验证零外部依赖成立
  *   4. embed-config     —— 嵌入配置解析与继承（离线，不发真实请求）
  *   5. host-wiring      —— 真实 cordis + storage + storage-domain
  *   6. sidebar-panel    —— 浏览器端 apply()，桩驱动验证三个插槽注册
+ *   7. manifest         —— 两份清单一致、版本是否跟上源码改动
  *
- * 前五个读源码或跑服务端，只有第六个真正执行 plugin/client.js 的 apply()。
+ * 前五个读源码或跑服务端，第六个真正执行 plugin/client.js 的 apply()，
+ * 第七个只读文件与 git 历史，守的是发版纪律而非运行时行为。
  *
  * 用法：node test/run-all.mjs
  */
@@ -28,6 +30,7 @@ const SUITES = [
   ["embed-config", "嵌入配置解析与继承（离线）"],
   ["host-wiring", "真实宿主装配（cordis + storage + domain）"],
   ["sidebar-panel", "侧栏面板注册（真实执行 apply）"],
+  ["manifest", "清单一致性 / 版本是否跟上源码"],
 ];
 
 const results = [];

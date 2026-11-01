@@ -40,7 +40,7 @@ dsh-memory/
 │   ├── cordis.patch.yml       bundle 补丁，声明插件默认配置
 │   ├── package.json           dsh.bundle.patch 指向上面那个 yml
 │   └── README.md              安装 / 设计 / 调参 / 排查，都在这
-├── test/                      6 个套件，401 项（不随 npm 包分发）
+├── test/                      7 个套件，436 项（不随 npm 包分发）
 └── tools/
     └── simulate.py            设计期数值探针（不是测试）
 ```
@@ -90,6 +90,46 @@ dsh --profile <你的 profile> --dump-config | grep memory-hybrid
 
 装完后库文件在 `~/.dsh/storages/memory_hybrid.sqlite`。
 
+### 升级：`github:` 装法不会自己跟进新提交
+
+**这是最容易踩的一个坑。** 装了之后，仓库再推新代码，重新执行同一条
+`dsh plugin ... add "github:dolou12388/dsh-memory-hybrid"` **拿到的还是旧版本**，
+而且输出照样显示 `+ dsh-memory-hybrid x.y.z`，看起来像成功了。
+
+原因在 pnpm 的解析逻辑：`github:owner/repo` 这种规格**不吃 semver**。首次安装时
+pnpm 把分支 HEAD 解析成一个具体 commit，钉进 lockfile：
+
+```yaml
+version: https://codeload.github.com/dolou12388/dsh-memory-hybrid/tar.gz/8e19f36dba...
+```
+
+之后再 `pnpm add` 同一个规格，它只比对包名与版本号是否已满足 —— 版本号没变，
+就认为「已经装的就是这个」，跳过下载，lockfile 原封不动。`dsh plugin add`
+内部走的就是 `pnpm add`（`dsh-plugin-manager` 里 `runPnpm(["add", spec, ...])`），
+所以从 dsh 这边完全看不出异常。
+
+三种正确的升级方式，任选一种：
+
+```bash
+# ① 显式钉 commit（最稳，规格里带 #<sha>）
+dsh plugin --profile <你的 profile> add \
+  "github:dolou12388/dsh-memory-hybrid#8e19f36dba91dbddbc66cd53abe6447cafe05cf9"
+
+# ② 先摘掉再装（清掉 lockfile 里的钉死记录）
+dsh plugin --profile <你的 profile> remove dsh-memory-hybrid
+dsh plugin --profile <你的 profile> add "github:dolou12388/dsh-memory-hybrid"
+
+# ③ 改用 link（开发期首选，永远是工作区最新代码）
+dsh plugin --profile <你的 profile> add "link:<本目录>/plugin"
+```
+
+或者直接进 profile 目录跑 `pnpm update dsh-memory-hybrid` —— 实测只有 `update`
+会重新解析 git 依赖，`add` 不会。
+
+**所以每次推新代码都要升版本号**（`package.json` 与 `plugin/package.json`
+两份一起改）。`test/manifest.test.mjs` 会在 `plugin/` 有改动而版本号未变时
+直接报失败，避免忘记。
+
 ### 两个前提
 
 1. **需要 pnpm** —— `dsh plugin` 把参数转发给 pnpm。若报
@@ -116,6 +156,7 @@ sqlite-embedded     38 项    内嵌引擎 / 持久化 / 损坏自愈
 embed-config        83 项    嵌入配置继承 / 断言 / 设置页控件匹配
 host-wiring         33 项    真实 cordis + storage + domain 装配
 sidebar-panel       27 项    侧栏三处插槽注册（真实执行 apply）
+manifest            35 项    两份清单一致 / 版本是否跟上源码改动
 ```
 
 `host-wiring` 用的是宿主真实服务而非 mock —— 装配时序问题只有真 cordis 才复现得出。
@@ -124,6 +165,10 @@ sidebar-panel       27 项    侧栏三处插槽注册（真实执行 apply）
 浏览器端代码装进沙箱，桩掉 React 与四个宿主 UI 包，让 `apply(ctx)` 真跑一遍，
 再检查 `ctx.slots.register` 实际收到的参数。核心那条断言是
 「侧栏 `id` === 主面板 `key`」—— 对不上时图标点下去毫无反应，且不报错。
+
+`manifest` 守的是发版纪律：两份 `package.json` 版本必须一致，且 `plugin/`
+有改动时版本号必须已经变过。这条规则的由来见上文
+「升级：`github:` 装法不会自己跟进新提交」。
 
 ---
 

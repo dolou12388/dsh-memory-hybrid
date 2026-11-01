@@ -819,8 +819,14 @@ window.__ModuleLoader__.load({
         //   · scope 变化 —— 本表单的写入被接受，字段值跟着更新
         // 只订阅 scope 是不够的：mirror 的内部读取是异步的，scope 的首次
         // `ready` 早于它，首次渲染时密钥状态会停留在「未配置」。
-        const mirror = ctx.configForms.describe();
-        this.unsubscribeMirror = mirror.subscribe(() => this.readSecrets());
+        //
+        // configForms 缺席时没有侧信道可订阅，退化成只订阅 scope —— 此时
+        // 密钥字段一律显示「未配置」，是这一路降级唯一诚实的表达。
+        const forms = ctx.get?.("configForms");
+        if (forms !== undefined) {
+          const mirror = forms.describe();
+          this.unsubscribeMirror = mirror.subscribe(() => this.readSecrets());
+        }
         this.unsubscribe = scope.subscribe(() => this.readSecrets());
         this.readSecrets();
       }
@@ -872,7 +878,9 @@ window.__ModuleLoader__.load({
       readSecrets() {
         const next = { embedApiKey: false, jevApiKey: false };
         try {
-          const mirror = this.ctx.configForms.describe();
+          const forms = this.ctx.get?.("configForms");
+          if (forms === undefined) throw new Error("configForms 缺席");
+          const mirror = forms.describe();
           const view = mirror.getSnapshot().view;
           const row = view?.namespaces?.find((candidate) => candidate.ns === NS);
           for (const secret of row?.secrets ?? []) {
@@ -909,7 +917,30 @@ window.__ModuleLoader__.load({
      * 插件装配
      * ------------------------------------------------------------------ */
 
-    const inject = ["slots", "locale", "configForms"];
+    /**
+     * 必需服务只有两个。
+     *
+     * `configForms` **刻意不在这里**。inject 是「等这些服务全部就绪才执行
+     * apply」——它是一种硬门禁，cordis 会安静地等，等不到就永远不调用 apply，
+     * 不报错、不打日志。
+     *
+     * 而本插件对 configForms 的依赖是「有了才能填设置表单」，不是「没有就
+     * 不该工作」。侧栏图标和主面板根本不需要它。把它写进 inject 的后果是：
+     * configForms 一旦因为任何上游原因（settings 插件没起来、remote 通道未就绪、
+     * describe 镜像还没建）迟迟不出现，整个 apply 就不执行 —— 侧栏、主面板、
+     * 设置页 tab 全都不会注册，且日志里干干净净。这正是「装了插件但左侧没有
+     * 记忆入口」最难查的那种失败。
+     *
+     * 正确分工（对应插件开发标准「必需依赖用 inject 声明，可选依赖用 ctx.get()
+     * 判空」）：
+     *
+     *   · slots / locale  —— 硬依赖，缺了整个插件没意义，进 inject
+     *   · configForms    —— 软依赖，用 ctx.get("configForms") 判空后降级
+     *
+     * 降级行为：拿不到 configForms 时侧栏与主面板照常注册，主面板显示
+     * 「配置尚未就绪」而不是崩掉；设置页 tab 不注册（它确实离不开表单）。
+     */
+    const inject = ["slots", "locale"];
 
     /** 侧栏面板 id，同时是 `main` keyed slot 的 key —— 两者必须一致，否则点图标不会切到本页。 */
     const PANEL_ID = "memory-hybrid";
@@ -924,21 +955,44 @@ window.__ModuleLoader__.load({
 
       const t = ctx.locale.bind(NS);
 
+      /**
+       * 取可选的 configForms 服务。
+       *
+       * `ctx.get()` 对未就绪/未提供的服务返回 undefined 而不是抛错 —— 这正是
+       * 软依赖该用的读法。拿不到时整个设置表单链路（控制器 + tab）跳过，
+       * 侧栏与主面板不受影响。
+       */
+      const configForms = () => ctx.get?.("configForms");
+
       // 先建控制器，再挂页面：控制器要订阅 scope，而 scope 来自
       // configForms，两者生命周期都绑在 ctx 上，用 ctx.effect 统一收口。
+      //
+      // ## 为什么这里用 ctx.inject 而不是直接把 configForms 写进 inject
+      //
+      // 两者差别是「整插件」还是「仅这一块」：
+      //
+      //   · 顶层 inject: ["slots","locale","configForms"] —— cordis 等三个服务
+      //     全部就绪才调 apply。configForms 迟到 = 整个插件静默不启动，
+      //     侧栏和主面板一起消失。
+      //   · ctx.inject(["configForms"], cb) —— 只延后这个回调。configForms
+      //     就绪时 cb 跑，没就绪就一直等；apply 本身照常执行，侧栏照常注册。
+      //
+      // 这正是软依赖该用的形态：把「等」的作用域收到最小。
       let controller;
-      ctx.effect(() => {
-        try {
-          controller = new MemoryCardController(ctx, ctx.configForms.get(NS));
-        } catch (error) {
-          ctx.logger?.warn?.(error);
-          controller = undefined;
-        }
-        return () => {
-          controller?.dispose();
-          controller = undefined;
-        };
-      }, "memory-hybrid: form");
+      ctx.inject(["configForms"], (child) => {
+        child.effect(() => {
+          try {
+            controller = new MemoryCardController(child, child.configForms.get(NS));
+          } catch (error) {
+            child.logger?.warn?.(error);
+            controller = undefined;
+          }
+          return () => {
+            controller?.dispose();
+            controller = undefined;
+          };
+        }, "memory-hybrid: form");
+      });
 
       // 传给页面的那一副面孔；控制器没建起来时给空 hooks，
       // 页面会落到「未加载」态而不是崩掉。
@@ -961,21 +1015,32 @@ window.__ModuleLoader__.load({
        * 这一处**确实**需要守卫 —— tab 里是可编辑表单，命名空间不可写时露出
        * 页面只会让人白填一遍。侧栏面板不能用同样的守卫，理由见下面 page 那段
        * 注释。
+       *
+       * configForms 不到场时这两层（ctx.inject + whileServed）都会安静地等，
+       * 且**只影响这一个 tab**：它不参与下面 ctx.effect 的 offs 数组，
+       * 所以侧栏与主面板不因它缺席而受影响。这是本文件与上一版最大的区别。
        */
-      const guardedTab = () =>
-        ctx.configForms.whileServed([NS], () =>
-          slot(
-            "settings.plugins.tab",
-            {
-              id: "memory-hybrid",
-              order: 20,
-              label: () => t("tab"),
-              locale: NS,
-              inject: props,
-            },
-            MemoryCard,
-          ),
+      ctx.inject(["configForms"], (child) => {
+        child.effect(
+          () =>
+            child.configForms.whileServed([NS], () =>
+              child.slots.inject("settings.plugins.tab", () =>
+                child.slots.register(
+                  {
+                    name: "settings.plugins.tab",
+                    id: "memory-hybrid",
+                    order: 20,
+                    label: () => t("tab"),
+                    locale: NS,
+                    inject: props,
+                  },
+                  MemoryCard,
+                ),
+              ),
+            ),
+          "memory-hybrid: tab",
         );
+      });
 
       // 侧栏图标与主面板：无条件注册。
       //
@@ -989,17 +1054,16 @@ window.__ModuleLoader__.load({
       //
       // 而且 whileServed 是**静默**不触发的：命名空间没被服务时它只是不调用
       // 回调，不报任何错。于是整个插件的 UI 全都不出现，日志里干干净净。
-      // 这正是「装了插件但左侧没入口」的直接原因。
       //
-      // 正确的分工：设置页 tab 继续跟随命名空间（它真的依赖），侧栏两处
-      // 直接注册（不依赖）。三处仍各自持有 disposer，交给 ctx.effect 统一收口。
+      // 同一类错误还有第二种形态：把 configForms 写进顶层 `inject`。那是硬
+      // 门禁，服务不就绪时 cordis 连 apply 都不调，静默程度更彻底。见文件
+      // 上方 `inject` 那段注释。
+      //
+      // 正确的分工：设置页 tab 由自己的 ctx.inject 收口，侧栏两处直接注册。
       ctx.effect(
         () => {
           const offs = [
-            // ① 设置页 tab：跟随命名空间，命名空间不可写时不该露出页面
-            guardedTab(),
-
-            // ② 侧栏图标：点击后由宿主调 layout.selectPanel(PANEL_ID)
+            // ① 侧栏图标：点击后由宿主调 layout.selectPanel(PANEL_ID)
             slot(
               "sidebar.panellist",
               {
@@ -1011,7 +1075,7 @@ window.__ModuleLoader__.load({
               MemoryIcon,
             ),
 
-            // ③ 主面板：keyed slot，key 必须与侧栏 id 相同
+            // ② 主面板：keyed slot，key 必须与侧栏 id 相同
             slot(
               "main",
               {

@@ -129,11 +129,25 @@ function loadClient() {
  * 记录每一处 `slots.register` 的调用参数，以及 `whileServed` 拿到的
  * 回调返回值 —— 后者用来验证 disposer 是否可调用。
  *
+ * `ctx.inject` 按真实语义实现：服务在 `state.provided` 里就立即给一个
+ * child（带该服务的复制 ctx）并执行回调；不在就一直等。`state.provide()`
+ * 用于测试中途投递服务，模拟「configForms 迟到」。
+ *
+ * @param {object} [options]
+ * @param {boolean} [options.withConfigForms] 初始就提供 configForms
  * @returns {object} { ctx, registrations, state }
  */
-function makeCtx() {
+function makeCtx({ withConfigForms = true } = {}) {
   const registrations = [];
-  const state = { whileServedDisposer: undefined, whileServedRan: false, effects: 0 };
+  const state = {
+    whileServedDisposer: undefined,
+    whileServedRan: false,
+    effects: 0,
+    /** 已提供但尚未抵达 inject 回调的条件 */
+    pending: [],
+    /** 当前已提供的服务名 */
+    provided: new Set(),
+  };
 
   const slots = {
     inject(name, fn) {
@@ -175,12 +189,51 @@ function makeCtx() {
     },
   };
 
+  const services = { slots, locale: {}, configForms };
+  if (withConfigForms) state.provided.add("configForms");
+
+  /**
+   * 把 ctx 变成「已提供某服务」的 child。
+   * 真实 cordis 就是这个语义：inject 回调拿到的 child 上能直接访问该服务，
+   * 且 child 上的 effect 跟随该服务的生命周期。
+   */
+  const makeChild = (parent, names) => {
+    const child = {
+      ...parent,
+      locale: parent.locale,
+      slots: parent.slots,
+      effect: parent.effect,
+      logger: parent.logger,
+      inject: parent.inject,
+      get: parent.get,
+    };
+    for (const name of names) {
+      child[name] = state.overrideConfigForms ?? services[name];
+    }
+    return child;
+  };
+
   const ctx = {
     slots,
-    configForms,
     locale: {
       register: () => {},
       bind: () => (key) => key,
+    },
+    // 软依赖读法：未提供就是 undefined，不抛错
+    get(name) {
+      return state.provided.has(name) ? services[name] : undefined;
+    },
+    /**
+     * 真实语义：等 names 全部就绪后调用 cb(child)；就绪前什么都不做。
+     * 这里记下未满足的回调，供 state.provide() 在测试中途触发。
+     */
+    inject(names, cb) {
+      const ready = names.every((name) => state.provided.has(name));
+      if (ready) {
+        cb(makeChild(ctx, names));
+        return;
+      }
+      state.pending.push({ names, cb, parent: ctx });
     },
     effect(fn) {
       state.effects += 1;
@@ -188,6 +241,18 @@ function makeCtx() {
       return disposer;
     },
     logger: { warn: () => {} },
+  };
+
+  /** 测试用：投递一个服务，并唤醒等待它的 inject 回调。 */
+  state.provide = (name) => {
+    state.provided.add(name);
+    const arrived = state.pending.filter((row) => row.names.includes(name));
+    state.pending = state.pending.filter((row) => !row.names.includes(name));
+    for (const row of arrived) {
+      if (row.names.every((n) => state.provided.has(n))) {
+        row.cb(makeChild(row.parent, row.names));
+      }
+    }
   };
 
   return { ctx, registrations, state };
@@ -211,6 +276,18 @@ if (client !== undefined) {
   eq("导出 apply", typeof client.apply, "function");
   eq("导出 PANEL_ID", client.PANEL_ID, "memory-hybrid");
   ok("导出 inject 含 slots", Array.isArray(client.inject) && client.inject.includes("slots"));
+
+  group("\n顶层 inject 只声明硬依赖");
+
+  // 这是本次事故的核心回归点。把 configForms 写进顶层 inject 会让 cordis
+  // 在它缺席时**连 apply 都不调** —— 侧栏、主面板、tab 一起消失，而且
+  // 不报错不打日志。configForms 必须是软依赖（ctx.inject / ctx.get）。
+  ok("inject 含 slots", client.inject?.includes("slots"));
+  ok("inject 含 locale", client.inject?.includes("locale"));
+  ok(
+    "inject 不含 configForms（它必须走软依赖，否则整个插件会被硬门禁挡住）",
+    !client.inject?.includes("configForms"),
+  );
 
   group("\napply() 注册行为");
 
@@ -261,14 +338,15 @@ if (client !== undefined) {
 
   group("\n收口");
 
-  // 关键结构：设置页 tab 走 whileServed（真的依赖命名空间可写），
-  // 侧栏两处无条件注册（侧栏不关心配置能否写）。早期版本把三处全包进
+  // 关键结构：侧栏两处无条件注册（侧栏不关心配置能否写），设置页 tab
+  // 由它自己的 ctx.inject + whileServed 两层守卫管。早期版本把三处全包进
   // whileServed，命名空间未被服务时整个 UI 都不出现 —— 这就是「装了插件
-  // 但左侧没入口」的根因。
+  // 但左侧没入口」的根因之一；把 configForms 写进顶层 inject 是同一个病的
+  // 另一种形态。
   eq("whileServed 回调返回了函数", typeof state.whileServedDisposer, "function");
 
   const before = registrations.length;
-  ok("撤销前有 3 个注册项", before === 3, `实际 ${before}`);
+  ok("初始有 3 个注册项", before === 3, `实际 ${before}`);
 
   state.whileServedDisposer?.();
   // 撤掉 whileServed 只应收回 tab，侧栏两处仍在 —— 它们不受命名空间影响
@@ -285,16 +363,19 @@ if (client !== undefined) {
 
   group("\n命名空间未被服务时侧栏仍要出现");
 
-  // 这是本次事故的回归点：whileServed 静默不触发（命名空间没被服务），
-  // 侧栏图标与主面板必须照旧注册，否则「左侧没入口」重演。
+  // 回归点一：whileServed 静默不触发（命名空间没被服务）时，侧栏图标与
+  // 主面板必须照旧注册，否则「左侧没入口」重演。
   {
     const bare = makeCtx();
     // 把这个 ctx 的 whileServed 改成「永不触发」—— 模拟命名空间未被服务
-    bare.ctx.configForms.whileServed = (namespaces, register) => {
+    const cfg = { ...bare.ctx.get("configForms") };
+    cfg.whileServed = (namespaces, register) => {
       bare.state.whileServedRan = true;
       bare.state.whileServedDisposer = undefined; // 回调根本没跑
       return () => {};
     };
+    // 让 child 拿到这个不会触发的 whileServed
+    bare.state.overrideConfigForms = cfg;
     client.apply(bare.ctx);
 
     const hasIcon = bare.registrations.some((row) => row.options.name === "sidebar.panellist");
@@ -305,6 +386,46 @@ if (client !== undefined) {
     ok("侧栏图标照样注册", hasIcon);
     ok("主面板照样注册", hasPage);
     ok("设置页 tab 被正确抑制（它确实依赖命名空间）", hasTab === false);
+  }
+
+  group("\nconfigForms 完全缺席（软依赖降级）");
+
+  // 回归点二 —— 本次事故的真正根因形态。configForms 服务不存在时：
+  //   · apply 必须照常执行完（顶层 inject 不含它）
+  //   · 侧栏图标与主面板必须注册
+  //   · 设置页 tab 不注册（它真的离不开表单）
+  //   · 全程不抛错
+  {
+    const soft = makeCtx({ withConfigForms: false });
+    let threw;
+    try {
+      client.apply(soft.ctx);
+    } catch (error) {
+      threw = error;
+    }
+
+    ok("configForms 缺席时 apply 不抛错", threw === undefined, threw?.message);
+
+    const hasIcon = soft.registrations.some((row) => row.options.name === "sidebar.panellist");
+    const hasPage = soft.registrations.some((row) => row.options.name === "main");
+    const hasTab = soft.registrations.some((row) => row.options.name === "settings.plugins.tab");
+
+    ok("侧栏图标必须注册（这是左侧入口）", hasIcon);
+    ok("主面板必须注册", hasPage);
+    ok("设置页 tab 不注册", hasTab === false);
+    // 控制器与 tab 各有一个 ctx.inject，configForms 缺席时两个都该在等
+    ok(
+      "configForms 的就绪回调被挂起等待",
+      soft.state.pending.length === 2,
+      `实际挂起 ${soft.state.pending.length} 个`,
+    );
+
+    // 后续 configForms 到达，tab 应该补上，侧栏不受影响
+    soft.state.provide("configForms");
+    const tabLater = soft.registrations.some((row) => row.options.name === "settings.plugins.tab");
+    const iconStill = soft.registrations.some((row) => row.options.name === "sidebar.panellist");
+    ok("configForms 迟到后 tab 补注册", tabLater);
+    ok("侧栏图标始终在", iconStill);
   }
 
   group("\n注入面");

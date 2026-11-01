@@ -553,7 +553,9 @@ ctx.effect(() => {
 
 `try/catch` 不是防御性冗余：三次 `register` 的返回类型由宿主决定，其中一个返回 `undefined` 时不该让另外两个漏掉。
 
-#### 事故：把三处都包进 whileServed，整个侧栏消失
+**注意**：上面这段是上一版的写法，它修掉了「whileServed 包住侧栏」的问题，但**侧栏仍然不出现** —— 因为同一个病还有第二种、更彻底的形态。见下面两节。
+
+#### 事故一：把三处都包进 whileServed，整个侧栏消失
 
 最初三处**全**包在 `ctx.configForms.whileServed([NS], ...)` 里，理由是「命名空间没被服务时不要露出空页面」。代价是：**侧栏图标根本不出现**。
 
@@ -574,6 +576,71 @@ ctx.effect(() => {
 用户看到的就是「装了插件但左侧没入口」，而日志里找不到任何线索。
 
 **判据**：需要命名空间里**可编辑的表单**才用 `whileServed`；纯粹展示、或只读 `slots` 的界面，直接注册。
+
+#### 事故二（更彻底）：把 configForms 写进顶层 inject
+
+修掉事故一之后侧栏**依然不出现**。继续查才发现同一处代码还有第二个坑：
+
+```js
+const inject = ["slots", "locale", "configForms"];   // ← 错
+```
+
+`inject` 不是「import 声明」，是**硬门禁**。cordis 的语义是「列出的服务全部就绪后才调用 apply」；等服务期间不报错、不打日志、不降级 —— 就是安静地不执行。
+
+所以 `configForms` 一旦因为任何上游原因迟到（settings 插件没起来、`remote` 通道未就绪、describe 镜像还没建），整个 `apply` 都不会跑：侧栏、主面板、设置页 tab **一起消失**，比事故一还干净。
+
+而本插件对 `configForms` 的依赖强度其实只是「有了才能填设置表单」，不是「没有就不该工作」。侧栏图标和主面板根本不需要它。
+
+**修法 —— 按依赖强度拆开**（对应插件开发标准「必需依赖用 inject 声明，可选依赖用 ctx.get() 判空」）：
+
+| 服务 | 依赖强度 | 声明方式 |
+|---|---|---|
+| `slots` / `locale` | 硬 —— 缺了整个插件没意义 | 顶层 `inject` |
+| `configForms` | 软 —— 只影响设置表单 | 自己的 `ctx.inject(["configForms"], cb)` |
+
+用到 `configForms` 的两处各自独立等待，互不牵连：
+
+```js
+// ① 控制器：服务到了才建；没到就一直等，apply 不受影响
+ctx.inject(["configForms"], (child) => {
+  child.effect(() => {
+    controller = new MemoryCardController(child, child.configForms.get(NS));
+    return () => { controller?.dispose(); };
+  }, "memory-hybrid: form");
+});
+
+// ② 设置页 tab：ctx.inject 之外再套 whileServed（命名空间可写）
+ctx.inject(["configForms"], (child) => {
+  child.effect(
+    () => child.configForms.whileServed([NS], () =>
+      child.slots.inject("settings.plugins.tab", () => child.slots.register({...}, MemoryCard))),
+    "memory-hybrid: tab",
+  );
+});
+
+// ③ 侧栏两处：完全不碰 configForms，无条件注册
+ctx.effect(() => {
+  const offs = [
+    slot("sidebar.panellist", { id: PANEL_ID, ... }, MemoryIcon),
+    slot("main", { key: PANEL_ID, ... }, MemoryPanelPage),
+  ];
+  return () => { for (const off of offs) { try { off?.(); } catch {} } };
+}, "memory-hybrid: page");
+```
+
+`ctx.get(name)` 的语义已核对 cordis 源码（`lib/index.js:763`）：
+
+```js
+/** Read a service from the store without the inject requirement.
+ *  @returns the service value, or `undefined` when not (yet) provided. */
+get(name, strict = true) {
+  return getTraceable(this.ctx, this._getImpl(name, strict)?.value);
+}
+```
+
+「without the inject requirement」+「`undefined` when not provided」正是软依赖要的两点。`MemoryCardController` 里两处读 `configForms` 的地方也据此改成 `ctx.get("configForms")` 判空。
+
+**判据**：问自己「这个服务缺席时，插件还有没有价值？」有 → 软依赖，用 `ctx.inject` 或 `ctx.get`；没有 → 硬依赖，进顶层 `inject`。侧栏属于「有」。
 
 #### 另一个静默坑：`dsh.client.inject` 写错不会有任何提示
 
@@ -1084,7 +1151,7 @@ cd <工作区根>          # 与 plugin/ 同级的那一层
 node test/run-all.mjs
 ```
 
-七个套件共 443 项：
+七个套件共 455 项：
 
 | 套件 | 项数 | 覆盖 |
 |---|---|---|
@@ -1093,8 +1160,8 @@ node test/run-all.mjs
 | `sqlite-embedded.test.mjs` | 38 | 内嵌引擎、持久化、损坏自愈 |
 | `embed-config.test.mjs` | 83 | 嵌入配置继承、断言、设置页控件匹配 |
 | `host-wiring.test.mjs` | 33 | 真实 cordis + storage + domain 装配 |
-| `sidebar-panel.test.mjs` | 27 | 侧栏三处插槽注册（真实执行 `apply()`） |
-| `manifest.test.mjs` | 35 | 两份清单一致、版本是否跟上源码 |
+| `sidebar-panel.test.mjs` | 44 | 侧栏两处插槽注册 + 软依赖降级（真实执行 `apply()`） |
+| `manifest.test.mjs` | 40 | 两份清单一致、inject 白名单、版本是否跟上源码 |
 
 `host-wiring` 用的是宿主真实的 `Storage` / `DomainFacility`，
 不是 mock —— 装配时序这类问题只有真 cordis 才复现得出。

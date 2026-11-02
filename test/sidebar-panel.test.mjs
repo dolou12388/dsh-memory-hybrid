@@ -101,7 +101,17 @@ function loadClient() {
         return { text: "", overridden: false, invalid: false };
       }
       shell() {
-        return { writable: true, dirty: false, saving: false, failed: false };
+        // 必须与真实 primitives 的 SettingsFormModel.shell() 一致
+        // （dsh-client-ui-primitives:7190）—— 少一个字段，卡片就会按错误
+        // 形状渲染，测试也就测不出「available 恒为 false」这类问题。
+        return {
+          available: true,
+          writable: true,
+          dirty: false,
+          invalid: false,
+          saving: false,
+          failed: false,
+        };
       }
       actions() {
         return { edit: () => {}, save: () => {}, discard: () => {}, resetField: () => {} };
@@ -239,19 +249,35 @@ function makeCtx({ withConfigForms = true } = {}) {
     },
   };
 
-  const services = { slots, locale: {}, configForms, remote: makeRemote() };
+  const remoteStub = makeRemote();
+  const services = {
+    slots,
+    locale: {},
+    configForms,
+    remote: remoteStub,
+    // 独立服务名，与真实 cordis 一致
+    "remote.settings": remoteStub.settings,
+  };
   if (withConfigForms) state.provided.add("configForms");
   // remote 是宿主的基础服务，真实部署里始终在场；本插件只把它当软依赖读
   state.provided.add("remote");
+  state.provided.add("remote.settings");
 
   /**
    * 把 ctx 变成「已提供某服务」的 child。
-   * 真实 cordis 就是这个语义：inject 回调拿到的 child 上能直接访问该服务，
-   * 且 child 上的 effect 跟随该服务的生命周期。
+   *
+   * 真实 cordis 的语义有两层，这里都要模拟，否则测不出真问题：
+   *
+   *   1. inject 回调拿到的 child 上能**直接**访问已声明的服务
+   *   2. 访问**未声明**的服务名会抛 `cannot get property "X" without inject`
+   *      （`cordis/lib/index.js:676`）
+   *
+   * 第 2 条是 0.2.3 第一版翻车的原因：`remote.settings` 是按命名空间注册的
+   * 独立服务名，只声明 `remote` 时读 `ctx.remote.settings` 会当场抛错。桩里
+   * 若让 `child.remote.settings` 随便就能读到，这个 bug 就永远测不出来。
    */
   const makeChild = (parent, names) => {
-    const child = {
-      ...parent,
+    const base = {
       locale: parent.locale,
       slots: parent.slots,
       effect: parent.effect,
@@ -259,13 +285,40 @@ function makeCtx({ withConfigForms = true } = {}) {
       inject: parent.inject,
       get: parent.get,
     };
-    for (const name of names) {
-      // overrideConfigForms 只顶替 configForms，不能污染 remote 等其它服务
-      child[name] = name === "configForms"
-        ? (state.overrideConfigForms ?? services[name])
-        : services[name];
-    }
-    return child;
+
+    /**
+     * `remote` 也做成 proxy：`remote.settings` 在真实 cordis 里是独立服务名
+     * （`remote.settings`），读它同样要过 inject 门禁。若这里直接返回一个
+     * 普通对象，`child.remote.settings` 就永远能读到 —— 那个坑测不出来。
+     */
+    const remoteProxy = new Proxy({}, {
+      get(_target, prop) {
+        if (typeof prop === "symbol") return undefined;
+        const full = `remote.${String(prop)}`;
+        if (names.includes(full)) return services[full];
+        // 声明了父级但没声明子级时，真实 cordis 抛的正是这句
+        throw new Error(`cannot get property "${String(prop)}" without inject`);
+      },
+    });
+
+    // 用 proxy 复现 inject 门禁：未声明的属性直接抛
+    return new Proxy(base, {
+      get(target, prop) {
+        if (typeof prop === "symbol" || prop.startsWith("_")) return Reflect.get(target, prop);
+        if (Reflect.has(target, prop)) return Reflect.get(target, prop);
+        if (!names.includes(prop)) {
+          throw new Error(`cannot get property "${String(prop)}" without inject`);
+        }
+        if (prop === "remote") return remoteProxy;
+        // overrideConfigForms 只顶替 configForms，不能污染其它服务
+        return prop === "configForms"
+          ? (state.overrideConfigForms ?? services[prop])
+          : services[prop];
+      },
+      has(target, prop) {
+        return Reflect.has(target, prop) || names.includes(prop);
+      },
+    });
   };
 
   const ctx = {
@@ -527,7 +580,7 @@ if (client !== undefined) {
     );
 
     // 端到端：自建 scope 能从 Host 读到本命名空间并落到 ready
-    const scope = new client.RemoteScope({ logger: {} }, client.NS, makeRemote());
+    const scope = new client.RemoteScope({ logger: {} }, client.NS, makeRemote().settings);
     ok("自建 scope 的 mode 是 remote", scope.getSnapshot().mode === "remote");
     ok("自建 scope 初始为 loading", scope.getSnapshot().status === "loading");
 
@@ -576,15 +629,95 @@ if (client !== undefined) {
     ok("sidebar 不受影响", hasIcon);
   }
 
+  group("\n设置通道的取用方式");
+
+  // 关于 `remote.settings` 的实测结论（在真实 cordis 上验过，别照抄网上的说法）：
+  //
+  //   · 在**插件 ctx** 里直接 `ctx.remote` 会抛
+  //     `cannot get property "remote" without inject`
+  //   · `ctx.get("remote.settings")` 与 `ctx.get("remote").settings` 都能拿到
+  //   · 声明了 `remote` 之后，`child.remote.settings` 也可用
+  //
+  // 所以 `inject` 里写两件是**防御性**的（与官方 `dsh-client-ui-settings` 一致），
+  // 但真正的取用入口必须是 `ctx.get(...)` —— 它「不受 inject 约束」
+  // （cordis:763），apply 里能同步拿到，不受时序影响。
+  {
+    const src = readFileSync(new URL("../plugin/client.js", import.meta.url), "utf8");
+
+    ok(
+      "apply 里用 ctx.get 同步取 settings",
+      src.includes('anyCtx.get?.("remote.settings")'),
+      "同步取不到才会退到异步 inject，否则控制器晚建、hooks 被 useMemo 钉死",
+    );
+    ok(
+      "有 remote.settings 的兼容读法",
+      src.includes('anyCtx.get?.("remote")?.settings'),
+    );
+    ok(
+      "inject 里两件都声明（与官方一致）",
+      src.includes('ctx.inject(["remote", "remote.settings"]'),
+    );
+    ok(
+      "升级分支声明了 configForms + remote.settings",
+      src.includes('ctx.inject(["configForms", "remote", "remote.settings"]'),
+    );
+    ok(
+      "代码里不再用裸 ctx.remote 取服务（会抛 without inject）",
+      // 只看非注释行：注释里提这个写法是为了解释为什么不这么写
+      !src.split("\n").some((line) => {
+        const code = line.trim();
+        if (code.startsWith("//") || code.startsWith("*") || code.startsWith("/*")) return false;
+        return /ctx\.remote\.settings/.test(code);
+      }),
+    );
+
+    // 桩本身也要有门禁能力
+    const probeCtx = makeCtx();
+    let threw = false;
+    try {
+      probeCtx.ctx.inject(["remote"], (child) => {
+        void child.remote.settings;
+      });
+    } catch {
+      threw = true;
+    }
+    ok("桩对未声明的服务名会抛错（复现 cordis 门禁）", threw);
+  }
+
   group("\n注入面");
 
-  // 页面靠 inject() 拿 hooks 与 actions；控制器没建成时也要给出可渲染的形状
-  const pageProps = page?.options.inject?.();
-  ok("主面板 inject 返回对象", pageProps !== undefined && typeof pageProps === "object");
-  ok("主面板 inject 含 hooks", pageProps?.hooks !== undefined || pageProps?.hooks === undefined);
-
-  const tabProps = tab?.options.inject?.();
-  ok("设置页 inject 返回对象", tabProps !== undefined && typeof tabProps === "object");
+  // bridge 的意义：宿主的 useMemo 会把 `inject()` 的返回值按
+  // `[actions, definition, scopeBinding]` 固化（renderer:1000），所以注入面
+  // 里的 hooks 必须是**稳定对象**，否则控制器晚建就永远注不进去。
+  {
+    const snap = page?.options.inject?.();
+    const second = page?.options.inject?.();
+    ok("主面板 inject 返回对象", snap !== undefined && typeof snap === "object");
+    ok(
+      "两次调用返回同一个 memoryCard source（hook 才能稳定）",
+      snap?.hooks?.memoryCard === second?.hooks?.memoryCard,
+      "每次新建 source 会让 observableHook 的 WeakMap 缓存失效",
+    );
+    ok(
+      "source 具备 getSnapshot / subscribe（absentSource 的契约）",
+      typeof snap?.hooks?.memoryCard?.getSnapshot === "function" &&
+        typeof snap?.hooks?.memoryCard?.subscribe === "function",
+    );
+    ok(
+      "初始快照形状完整（缺字段会在渲染中途炸）",
+      (() => {
+        const s = snap?.hooks?.memoryCard?.getSnapshot();
+        return (
+          s !== undefined &&
+          "available" in s && "writable" in s && "secrets" in s && "diagnostics" in s
+        );
+      })(),
+    );
+    ok(
+      "动作是代理而非首帧绑定（控制器后建也能用）",
+      typeof snap?.edit === "function" && typeof snap?.save === "function",
+    );
+  }
 }
 
 /* ------------------------------------------------------------------ */

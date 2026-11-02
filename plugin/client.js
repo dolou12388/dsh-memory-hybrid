@@ -578,6 +578,60 @@ window.__ModuleLoader__.load({
           ].filter(Boolean),
         );
 
+      /**
+       * 不可用时自己渲染，不交给 `SettingsForm`。
+       *
+       * `SettingsForm` 在 `!state.available` 时**直接返回一行字，children 根本
+       * 不渲染**（primitives:6926）：
+       *
+       *     if (!state.available) return jsx("p", { children: labels.unavailable });
+       *
+       * 所以诊断只能在这一层补。这些是普通值而非 hook，会随控制器就绪更新
+       * ——hooks 那边被宿主 useMemo 按 [actions, definition, scopeBinding]
+       * 缓存，控制器晚建就再也注不进去。
+       */
+      if (!state.available) {
+        // 诊断从 state 里取而不是 props：props 的注入面被首帧固化，
+        // state 走 bridge 的 subscribe，会随控制器就绪而更新
+        const d = state.diagnostics ?? { mode: "?", status: "?", own: false, error: "" };
+        return h(
+          "div",
+          null,
+          [
+            h(
+              "p",
+              {
+                key: "msg",
+                role: "status",
+                style: {
+                  margin: 0,
+                  fontSize: 13,
+                  lineHeight: 1.6,
+                  color: "var(--dsw-alias-label-secondary)",
+                },
+              },
+              labels.unavailable,
+            ),
+            h(
+              "p",
+              {
+                key: "diag",
+                style: {
+                  margin: "10px 0 0",
+                  fontSize: 12,
+                  lineHeight: 1.6,
+                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                  color: "var(--dsw-alias-label-tertiary)",
+                  whiteSpace: "pre-wrap",
+                },
+              },
+              `mode=${d.mode} status=${d.status} own=${d.own ? "y" : "n"}` +
+                (d.error ? `\n${d.error}` : ""),
+            ),
+          ],
+        );
+      }
+
       return h(
         SettingsForm,
         {
@@ -843,14 +897,41 @@ window.__ModuleLoader__.load({
      */
     class RemoteScope {
       /**
-       * @param {object} ctx 插件上下文
+       * @param {object} ctx 插件上下文（只用于 logger）
        * @param {string} namespace 设置命名空间
-       * @param {object} remote `ctx.remote`，由调用方经 `ctx.inject(["remote"])` 取到
+       * @param {object} settings `remote.settings` 这个 API 对象本身，
+       *   由调用方在 `ctx.inject(["remote", "remote.settings"])` 的 child 上取一次。
+       *
+       * ## 为什么收 `settings` 而不是 `remote`
+       *
+       * cordis 的 ctx 是 proxy，属性访问有一道 inject 门禁
+       * （`cordis/lib/index.js:676`）：
+       *
+       *     const error = new Error(`cannot get property "${prop}" without inject`)
+       *     ...
+       *     if (prop in fiber.inject) { error.message = "cannot get resolved service ..."; throw error }
+       *
+       * `remote.settings` 不是 `remote` 上的普通属性，它是按命名空间注册的
+       * **独立服务名**（`dsh-api-remotes` 用 `namespace: "settings"` 注册）。
+       * 所以只声明 `remote` 是不够的 —— 读 `ctx.remote.settings` 会抛
+       * 「cannot get property "settings" without inject」。
+       *
+       * 这正是 0.2.3 第一版没生效的原因：只 inject 了 `remote`，访问
+       * `this.remote.settings` 就抛，而 catch 把它吞成了 `unavailable`，
+       * 界面于是仍旧显示「该插件当前未加载」。
+       *
+       * 官方插件的写法印证了这一点 —— `dsh-client-ui-settings` 的
+       * `inject = ["remote", "remote.settings"]`，两件都写。宿主 `ConfigForms`
+       * 甚至专门保留 providing fiber 来绕开它，注释里写着：
+       * 「would make every caller declare `remote.settings` in its own inject」。
+       *
+       * 收一个已经取到的 API 对象，后续 `describe()` / `mutate()` 都是普通
+       * 方法调用，不再经过 ctx proxy，也就没有第二次门禁。
        */
-      constructor(ctx, namespace, remote) {
+      constructor(ctx, namespace, settings) {
         this.ctx = ctx;
         this.namespace = namespace;
-        this.remote = remote;
+        this.settings = settings;
 
         this.state = {
           status: "loading",
@@ -917,20 +998,52 @@ window.__ModuleLoader__.load({
       async load() {
         const generation = ++this.generation;
         try {
-          const response = await this.remote.settings.describe();
+          const response = await this.settings.describe();
           if (this.disposed || generation !== this.generation) return false;
           if (!response.ok) {
-            this.setState({ status: "unavailable" });
+            this.fail("describe rejected", response.error);
             return false;
           }
           this.fold(response.value);
           return true;
-        } catch {
+        } catch (error) {
           if (this.disposed || generation !== this.generation) return false;
-          // 通道异常：标 unavailable 而不是永远 loading，让界面能说出实话
-          this.setState({ status: "unavailable" });
+          this.fail("describe threw", error);
           return false;
         }
+      }
+
+      /**
+       * 记下失败原因，然后标 unavailable。
+       *
+       * 早先这里是空的 `catch {}` —— 于是「访问被 inject 门禁拦下」和
+       * 「Host 真的没服务这个命名空间」在界面上长得一模一样，排查时只能靠猜。
+       * 0.2.3 第一版就是被这个静默吞掉真因、白绕了一圈。
+       *
+       * 现在至少做到两点：
+       *   · 把原始错误打到 console（浏览器 F12 可见）
+       *   · 存进快照，界面上能区分「没配好」与「Host 没服务」
+       *
+       * @param {string} what 失败发生在哪一步
+       * @param {unknown} detail 原始错误或 error 对象
+       */
+      fail(what, detail) {
+        const message = detail instanceof Error
+          ? detail.message
+          : detail && typeof detail === "object" && typeof detail.message === "string"
+            ? detail.message
+            : String(detail ?? "unknown");
+        this.lastError = `${what}: ${message}`;
+        try {
+          // 只在第一次失败时打，避免订阅驱动的重复 load 刷屏
+          if (!this.reported) {
+            this.reported = true;
+            console.warn(`[dsh-memory-hybrid] 设置通道不可用 —— ${this.lastError}`);
+          }
+        } catch {
+          // console 不可用（例如非浏览器环境）时忽略
+        }
+        this.setState({ status: "unavailable" });
       }
 
       /**
@@ -973,17 +1086,19 @@ window.__ModuleLoader__.load({
         if (this.disposed) return false;
         const revision = expectedRevision ?? this.state.revision;
         try {
-          const response = await this.remote.settings.mutate(this.namespace, ops, revision);
+          const response = await this.settings.mutate(this.namespace, ops, revision);
           if (this.disposed) return true;
           if (!response.ok) {
             // 冲突/被拒：重读一次，让界面回到 Host 的真相
+            this.fail("mutate rejected", response.error);
             await this.load();
             return false;
           }
           // Host 在写成功后直接回该命名空间的新视图，省掉一次 describe
           this.fold({ writable: this.state.writable, namespaces: [response.value] });
           return true;
-        } catch {
+        } catch (error) {
+          this.fail("mutate threw", error);
           await this.load();
           return false;
         }
@@ -1023,6 +1138,59 @@ window.__ModuleLoader__.load({
       return snapshot.mode !== "memory";
     }
 
+    /**
+     * 极简 snapshot store。
+     *
+     * 只实现宿主 `observableHook` 要求的两个方法 —— 对照
+     * `dsh-client-ui-renderer/lib/client.js:228` 的 `absentSource`：
+     *
+     *     { getSnapshot: () => void 0, subscribe: () => () => {} }
+     *
+     * `getSnapshot()` 必须返回**稳定引用**（只在 `set` 时换新对象），否则
+     * `useSyncExternalStore` 会认为每次都变了，无限重渲染。
+     *
+     * @param {object} initial 初始快照
+     * @returns {object} { getSnapshot, subscribe, set }
+     */
+    function createBridge(initial) {
+      let snapshot = initial;
+      const listeners = new Set();
+      return {
+        getSnapshot: () => snapshot,
+        subscribe(listener) {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+        set(next) {
+          snapshot = next;
+          for (const listener of listeners) {
+            try {
+              listener();
+            } catch {
+              // 单个订阅者抛错不该拖垮其余订阅者
+            }
+          }
+        },
+      };
+    }
+
+    /**
+     * 控制器还没建起来时的投影。
+     *
+     * 形状必须与 `MemoryCardController.projection()` 一致：组件拿它按同样的
+     * 键取用，缺字段会在渲染中途炸掉。
+     */
+    const EMPTY_CARD_STATE = {
+      available: false,
+      writable: false,
+      dirty: false,
+      invalid: false,
+      saving: false,
+      failed: false,
+      secrets: { embedApiKey: false, jevApiKey: false },
+      diagnostics: { mode: "none", status: "no-controller", own: false, error: "" },
+    };
+
     /* ------------------------------------------------------------------ *
      * 配置卡片控制器
      * ------------------------------------------------------------------ */
@@ -1038,12 +1206,12 @@ window.__ModuleLoader__.load({
     class MemoryCardController {
       /**
        * @param {object} ctx 插件上下文
-       * @param {object} remote `ctx.remote`
+       * @param {object} settings `remote.settings` API 对象（不是 `ctx.remote`）
        * @param {object} [hostScope] 宿主的 `configForms.get(NS)`；不可用时自建
        */
-      constructor(ctx, remote, hostScope) {
+      constructor(ctx, settings, hostScope) {
         this.ctx = ctx;
-        this.remote = remote;
+        this.settings = settings;
         this.secrets = { embedApiKey: false, jevApiKey: false };
 
         // 绝大多数部署里宿主 scope 是好的，直接用它 —— 它额外提供
@@ -1091,7 +1259,27 @@ window.__ModuleLoader__.load({
 
       /** 建一个只走 remote 的 scope，并随控制器一起释放。 */
       adoptRemoteScope() {
-        return new RemoteScope(this.ctx, NS, this.remote);
+        return new RemoteScope(this.ctx, NS, this.settings);
+      }
+
+      /**
+       * 排障用的一份快照。
+       *
+       * 「配置页显示未加载」这件事在界面上只有一句话，而它的可能来源至少有
+       * 四种（控制器没建、scope 没就绪、Host 拒绝、通道抛错），从外面完全
+       * 分不开。所以把这几个关键值一并暴露给组件，不可用时直接画在界面上 ——
+       * 用户截一张图就能定位，不必再靠猜。
+       *
+       * @returns {object} 诊断字段
+       */
+      diagnostics() {
+        const snapshot = this.scope?.getSnapshot?.() ?? {};
+        return {
+          mode: snapshot.mode ?? "?",
+          status: snapshot.status ?? "?",
+          own: this.ownScope !== undefined,
+          error: this.ownScope?.lastError ?? "",
+        };
       }
 
       /** 页面渲染所需的全部状态。 */
@@ -1099,7 +1287,14 @@ window.__ModuleLoader__.load({
         const fields = {};
         for (const spec of fieldSpecs()) fields[spec.field] = this.form.field(spec.field);
         for (const field of secretFields()) fields[field] = this.form.field(field);
-        return { ...this.form.shell(), ...fields, secrets: { ...this.secrets } };
+        return {
+          ...this.form.shell(),
+          ...fields,
+          secrets: { ...this.secrets },
+          // 诊断也放进投影：它随快照一起流动，界面才能实时看到
+          // 「正在连 / 连上了 / 为什么连不上」的演进
+          diagnostics: this.diagnostics(),
+        };
       }
 
       /**
@@ -1303,13 +1498,43 @@ window.__ModuleLoader__.load({
       // ②只做「升级」，从不降级：一旦已经在用宿主 scope，就不会再被换回自建。
       let controller;
 
+      // bridge 与 actions 必须在 install 之前定义 —— install 里要用，
+      // 而且 apply 是同步调 install 的，晚定义会撞上 TDZ。
+      //
+      // 这两样都是**长期存在**的：控制器来了写 bridge、不来它也表达「还没连上」，
+      // 界面永远有东西可读。详见下面 props 处的说明。
+      let bridgeOff;
+      const bridge = createBridge(EMPTY_CARD_STATE);
+
+      /** 把某个控制器的投影接到 bridge 上（换控制器时自动断开旧的）。 */
+      const bindController = (next) => {
+        bridgeOff?.();
+        bridgeOff = undefined;
+        bridge.set(next.projection());
+        bridgeOff = next.store.subscribe(() => bridge.set(next.projection()));
+      };
+
+      /**
+       * 一套始终可用的动作代理。
+       *
+       * 同样会被首帧固化，所以不能直接绑定 `controller.form.actions()`
+       * （那时可能还没有 controller）。改成转发到当前 controller，
+       * 这样无论控制器何时建好，按钮都是通的。
+       */
+      const actions = {
+        edit: (field, text) => controller?.form.actions().edit(field, text),
+        resetField: (field) => controller?.form.actions().resetField(field),
+        save: () => controller?.form.actions().save(),
+        discard: () => controller?.form.actions().discard(),
+      };
+
       /**
        * 用当前可得的 scope 建（或升级）控制器。
        *
        * @param {object} scopeCtx 提供 configForms 的上下文
-       * @param {object} remote `ctx.remote`
+       * @param {object} settings `remote.settings` API 对象
        */
-      const install = (scopeCtx, remote) => {
+      const install = (scopeCtx, settings) => {
         const forms = scopeCtx.get?.("configForms");
         let hostScope;
         try {
@@ -1321,25 +1546,62 @@ window.__ModuleLoader__.load({
         const upgrade = hostScope !== undefined && isScopeServable(hostScope);
         // 已经在用可用的宿主 scope 时不重建，否则每次 setup 都会重发 describe
         if (controller !== undefined && !upgrade) return;
+        // 既没有可用的宿主 scope、又拿不到 settings 时，建出来也是废的
+        // （RemoteScope 无从读写），不如让面板老实停在诊断态
+        if (!upgrade && settings === undefined) return;
 
+        bridgeOff?.();
+        bridgeOff = undefined;
         controller?.dispose();
-        controller = new MemoryCardController(scopeCtx, remote, upgrade ? hostScope : undefined);
+        controller = new MemoryCardController(scopeCtx, settings, upgrade ? hostScope : undefined);
+        bindController(controller);
       };
 
-      // ① 立即可用。`RemoteScope` 只依赖 `remote.settings`，那是个一直挂着的
-      //    服务，所以这一步在 loopback 与非 loopback 上都能成。
+      // ① 先同步建一次。
       //
-      //    `remote` 用 ctx.inject 取，不写进顶层 inject —— 它缺席时插件仍要
-      //    能注册侧栏（哪怕是降级态），不该被硬门禁挡住整个 apply。
-      ctx.inject(["remote"], (child) => {
+      //    为什么必须同步：宿主的渲染器把 inject 结果按
+      //    `[actions, definition, scopeBinding]` 做了 useMemo
+      //    （`dsh-client-ui-renderer/lib/client.js:1000`）。控制器若晚于
+      //    首次渲染才建好，`hooks` 就**再也不会**重新求值——面板会永远停在
+      //    「未加载」，哪怕控制器此后一直好好的。
+      //
+      //    `ctx.get(name)` 的语义是「读取服务但不受 inject 约束」
+      //    （cordis:763 `Read a service from the store without the inject
+      //    requirement`），所以它可以同步拿到已就绪的服务。
+      //
+      //    注意：`remote.settings` 是**独立服务名**（`dsh-api-remotes` 用
+      //    `namespace: "settings"` 注册），所以要按全名 get，不是
+      //    `get("remote").settings`。
+      const readSettings = (anyCtx) => {
+        try {
+          const direct = anyCtx.get?.("remote.settings");
+          if (direct !== undefined) return direct;
+        } catch {
+          // 某些上下文里 get 也可能抛，落到下面的兼容读法
+        }
+        try {
+          return anyCtx.get?.("remote")?.settings;
+        } catch {
+          return undefined;
+        }
+      };
+
+      try {
+        const settings = readSettings(ctx);
+        if (settings !== undefined) install(ctx, settings);
+      } catch (error) {
+        ctx.logger?.warn?.(error);
+      }
+
+      // ② 同步没拿到（服务尚未就绪）时退到 ctx.inject：它只延后这个回调，
+      //    不阻塞 apply，侧栏照常注册。
+      ctx.inject(["remote", "remote.settings"], (child) => {
         child.effect(() => {
-          const remote = child.remote;
           if (controller !== undefined) return () => {};
           try {
-            install(child, remote);
+            install(child, readSettings(child));
           } catch (error) {
             child.logger?.warn?.(error);
-            controller = undefined;
           }
           return () => {
             controller?.dispose();
@@ -1348,14 +1610,16 @@ window.__ModuleLoader__.load({
         }, "memory-hybrid: form");
       });
 
-      // ② 择机升级到宿主 scope（它的镜像与其他设置页共享，外部改动会跟着刷新）。
-      //    用 ctx.inject 而不是把 configForms 写进顶层 inject，理由同上：
-      //    configForms 缺席时这里安静不跑，而 ① 已经把面板撑起来了。
-      ctx.inject(["configForms", "remote"], (child) => {
+      // ③ 择机升级到宿主 scope（它的镜像与其他设置页共享，外部改动会跟着刷新）。
+      //
+      //    注意**不能**写成「已有 controller 就跳过」：① 里同步建的那个大概率
+      //    是 RemoteScope，若这里跳过，loopback 部署也永远用不上宿主共享镜像。
+      //    所以这里无条件调 install，由它自己判断「能不能升级」——
+      //    能升级才重建，否则原样返回。
+      ctx.inject(["configForms", "remote", "remote.settings"], (child) => {
         child.effect(() => {
-          if (controller !== undefined) return () => {};
           try {
-            install(child, child.remote);
+            install(child, readSettings(child));
           } catch (error) {
             child.logger?.warn?.(error);
           }
@@ -1363,9 +1627,20 @@ window.__ModuleLoader__.load({
         }, "memory-hybrid: form upgrade");
       });
 
-      // 传给页面的那一副面孔；控制器没建起来时给空 hooks，
-      // 页面会落到「未加载」态而不是崩掉。
-      const props = () => (controller ? controller.inject() : { hooks: {} });
+      // ## 为什么必须有 bridge
+      //
+      // 宿主的渲染器把 inject 的结果按 `[actions, definition, scopeBinding]`
+      // 做了 useMemo（`dsh-client-ui-renderer/lib/client.js:1000`），也就是
+      // **`props()` 只在首帧被调用一次**，之后返回值被固化。
+      //
+      // 如果 `props()` 直接返回 `controller.inject()`，而控制器那时还没建好，
+      // 注入面就是空 hooks —— 之后控制器建好了也没用，界面永远停在「未加载」。
+      //
+      // 宿主的 `observableHook` 按 **source 对象身份**缓存（`hookCache` 是
+      // WeakMap），所以只要每次返回**同一个** source 对象，hook 就稳定；
+      // 数据更新走 source 自己的 subscribe/getSnapshot，不依赖重新注入。
+      // （`absentSource` 就是这么写的：只有这两个方法。）
+      const props = () => ({ hooks: { memoryCard: bridge }, ...actions });
 
       /**
        * 注册一处插槽，返回它自己的 disposer。
@@ -1426,10 +1701,12 @@ window.__ModuleLoader__.load({
         }
 
         // 非 loopback：用 RPC 自己确认一次命名空间是否被服务。
-        child.inject(["remote"], (grand) => {
+        child.inject(["remote", "remote.settings"], (grand) => {
           grand.effect(
             () => {
-              const probe = new RemoteScope(grand, NS, grand.remote);
+              const settings = readSettings(grand);
+              if (settings === undefined) return () => {};
+              const probe = new RemoteScope(grand, NS, settings);
               let off;
               const stop = probe.subscribe(() => {
                 const snapshot = probe.getSnapshot();

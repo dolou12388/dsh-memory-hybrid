@@ -794,6 +794,105 @@ subscribe(listener) {
 
 另外：**宿主没报错不代表宿主没拒绝你**。`memory` 分支是 `return Promise.resolve(false)`，静默返回失败，连 console 都不打。这类「安静地拒绝」只能靠读源码定位，看日志是看不出来的。
 
+#### 事故四（真凶）：注入面被首帧固化
+
+事故三的修法上线后**仍然不能用**，而且界面上连新加的诊断行都没有出现 ——
+这一条本身就是线索：说明渲染的还是旧路径。
+
+继续查下去，找到两个叠加原因。第一个是事故三里的误判，先纠正。
+
+##### 纠正：`remote.settings` 不需要单独声明
+
+事故三里曾断定「只声明 `remote` 时读 `remote.settings` 会抛 without inject」，
+依据是 `createTraceable` 的 associate 分支加上官方插件的 `inject` 写法。这个
+判断是错的。20 行真实 cordis 实验就推翻了：
+
+```
+场景 A: inject = ["remote"]                    => 访问成功
+场景 B: inject = ["remote", "remote.settings"] => 访问成功
+```
+
+补一个**插件 ctx**（而不是 root ctx）的实验，才看清真实边界：
+
+```
+ctx.get("remote.settings")   => 拿到, describe=function
+ctx.get("remote").settings   => 拿到
+ctx.remote                   => 抛 cannot get property "remote" without inject
+```
+
+| 读法 | 是否可用 | 说明 |
+|---|---|---|
+| `ctx.get(name)` | 总是可用 | cordis:763「without the inject requirement」 |
+| `ctx.get("remote").settings` | 可用 | 拿到服务实例后访问普通属性 |
+| `ctx.remote` | **抛错** | `remote` 本身没进 inject 时的属性门禁 |
+
+所以 `remote.settings` 单独声明只是与官方对齐的**防御**，不是必需；
+而裸 `ctx.remote` 在插件里是真的不能读。
+
+##### 真因：`props()` 只在首帧被调用一次
+
+`dsh-client-ui-renderer/lib/client.js:1000`：
+
+```js
+const injected = useMemo(() => runInject(definition, scopeBinding, actions),
+                          [actions, definition, scopeBinding]);
+```
+
+`inject()` 的返回值被 useMemo 固化。控制器若在那之前还没建好，注入面就是
+空 hooks，**此后控制器再好也注不进去** —— 界面永远停在「未加载」。
+
+这解释了为什么前几版的逻辑单看都对、就是不生效：它们都在「控制器什么时候
+建好」上做文章，而真正的约束是「注入面只有一次机会」。
+
+##### 修法：稳定的 bridge
+
+宿主 `observableHook` 按 **source 对象身份**缓存（`hookCache` 是 WeakMap），
+而 `absentSource` 只需要两个方法：
+
+```js
+const absentSource = { getSnapshot: () => void 0, subscribe: () => () => {} };
+```
+
+于是把注入面做成**长期存在**的对象，与控制器解耦：
+
+```js
+// apply 里建一次，永不更换
+const bridge = createBridge(EMPTY_CARD_STATE);
+
+// 控制器建好后把投影写进去，并跟随它的变更
+const bindController = (next) => {
+  bridgeOff?.();
+  bridge.set(next.projection());
+  bridgeOff = next.store.subscribe(() => bridge.set(next.projection()));
+};
+
+// props 永远返回同一个 source
+const props = () => ({ hooks: { memoryCard: bridge }, ...actions });
+```
+
+动作同理，改成**转发代理**而不是绑定某一刻的快照：
+
+```js
+const actions = {
+  edit: (field, text) => controller?.form.actions().edit(field, text),
+  save: () => controller?.form.actions().save(),
+  // ...
+};
+```
+
+这样控制器早来晚来都不影响：hook 身份稳定，数据走 `subscribe` 更新。
+
+##### 教训
+
+1. **不要用读源码代替实测。** 这一轮两次误判（`storageDomain`、
+   `remote.settings`）都是「源码看着像」就下结论，两次都被实验推翻。
+   真实 cordis 实验只要 20 行，成本远低于一轮错误的修复。
+2. **空 `catch {}` 是排查杀手。** 它把「inject 拦截」「服务不存在」
+   「RPC 失败」压成同一个 `unavailable`，界面和日志都看不出来。
+   现在失败一律 `console.warn` 并记 `lastError` 上界面。
+3. **界面要能自证版本。** 面板副标题带 `v0.2.6`。SPA 切换面板不会重拉
+   bundle，服务端更新后界面毫无区别 —— 一行版本号能省掉整轮互相猜测。
+
 #### 另一个静默坑：`dsh.client.inject` 写错不会有任何提示
 
 `package.json` 的 `dsh.client.inject` 只能列**真实存在、且该包自己声明了 `dsh.client`** 的模块。写错的表现同样是完全静默：
@@ -1303,7 +1402,7 @@ cd <工作区根>          # 与 plugin/ 同级的那一层
 node test/run-all.mjs
 ```
 
-七个套件共 472 项：
+七个套件共 480 项：
 
 | 套件 | 项数 | 覆盖 |
 |---|---|---|
@@ -1312,7 +1411,7 @@ node test/run-all.mjs
 | `sqlite-embedded.test.mjs` | 38 | 内嵌引擎、持久化、损坏自愈 |
 | `embed-config.test.mjs` | 83 | 嵌入配置继承、断言、设置页控件匹配 |
 | `host-wiring.test.mjs` | 33 | 真实 cordis + storage + domain 装配 |
-| `sidebar-panel.test.mjs` | 58 | 侧栏两处插槽注册 + 软依赖降级 + 非 loopback 自立（真实执行 `apply()`） |
+| `sidebar-panel.test.mjs` | 66 | 侧栏插槽注册 + 软依赖降级 + 非 loopback 自立 + bridge 稳定性（真实执行 `apply()`） |
 | `manifest.test.mjs` | 40 | 两份清单一致、inject 白名单、版本是否跟上源码 |
 
 `host-wiring` 用的是宿主真实的 `Storage` / `DomainFacility`，

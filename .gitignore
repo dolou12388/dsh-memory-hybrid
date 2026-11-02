@@ -34,8 +34,14 @@ desktop.ini
 *.swp
 *~
 
-# AI 工作记忆（决策笔记，属个人工作区，不随仓库分发）
+# AI 工作记忆与工具配置（个人工作区，不随仓库分发）
 .workbuddy/
+.claude/
+
+# 设计期探针的本地产物（可由 tools/make-snapshot.mjs 重新生成 / 重新下载）
+tools/snapshot.sample.json
+tools/snapshot.seed.json
+tools/force-graph.min.js
 
 # 设计文档：本地保留，不进版本库
 docs/

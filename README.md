@@ -34,15 +34,23 @@
 ```
 dsh-memory/
 ├── plugin/                    插件包（可 npm pack 分发）
-│   ├── src/                   16 个模块，4,314 行
+│   ├── src/                   16 个模块，另有 src/graph/rpc.js 提供图谱取数通道
 │   ├── client.js              浏览器端：设置页 tab + 侧栏面板（1,046 行）
 │   ├── vendor/sqlite/         内嵌 SQLite wasm 引擎（零外部依赖的关键）
 │   ├── cordis.patch.yml       bundle 补丁，声明插件默认配置
 │   ├── package.json           dsh.bundle.patch 指向上面那个 yml
 │   └── README.md              安装 / 设计 / 调参 / 排查，都在这
-├── test/                      7 个套件，436 项（不随 npm 包分发）
+├── graph/                     附属包：记忆星图面板（可选，另装）
+│   ├── client.js              浏览器半：布局 + 绘制 + 交互
+│   ├── src/index.js           宿主半：存在的意义只是让浏览器半进启动图
+│   └── README.md              交互编码 / 装法 / 通道绕行 / 已知限制
+├── test/                      9 个套件（不随 npm 包分发）
 └── tools/
-    └── simulate.py            设计期数值探针（不是测试）
+    ├── simulate.py            设计期数值探针（不是测试）
+    ├── make-snapshot.mjs      生成图谱样本快照（用真衰减公式）
+    ├── seed-store.mjs         把样本灌进/清出真实库，供实机看效果
+    ├── graph-lab.html         图谱视觉编码探针（单页，无构建）
+    └── graph-snapshot.md      快照数据约定（核心 → 可视化 的只读投影）
 ```
 
 ---
@@ -184,6 +192,72 @@ python -X utf8 tools/simulate.py
 `tools/simulate.py` 不参与 CI，它回答的是「这组参数在这套模型里自洽吗」——
 四档存活期跨度、稳态层占比、九项结构约束。具体看什么，见
 [`plugin/README.md`](plugin/README.md)「改参数的复核清单」。
+
+---
+
+## 记忆图谱
+
+星图面板已经是**正式附属包 [`graph/`](graph/README.md)**，不再只是设计期探针：
+侧栏多一个「图谱」图标，点开是整库的可交互星图（滚轮缩放、拖背景平移、拖节点改位置、
+点星高亮一跳邻居、详情卡列邻居并可继续跳、按档位过滤、适配/重排/刷新）。
+
+装法见 [`graph/README.md`](graph/README.md)「安装」，其中两条最常踩：
+
+1. **profile 里必须有 `@deepseek-ai/dsh-web-app`。** 只有 `dsh-base` 时 `dsh web`
+   直接退出码 1，且没有任何能指向病因的报错 —— 本条面板挂 `sidebar.panellist`，
+   没有 web 层就无处可挂，表现成「装好了但看不见」。
+2. **启动不要带 `web` 子命令。** profile 自身即应用，`dsh --profile X web` 报
+   `too many arguments`；正确是 `dsh --profile X --no-open --port 8791`，
+   然后带上终端打印的 `?token=` 访问（裸开根路径 401 是认证在工作）。
+
+数据只从核心的 RPC 通道 `/memory-hybrid/graph` 拿，本包不二次读库（原因见 graph/README
+「依赖」）。通道是自己挂在 `webServer` 上的前缀路由，不用 `connection.rpc.handle()` ——
+后者的 owner ctx 缺 `webServer` 许可，会把注册错误静默吞掉，症状是面板恒报 405。
+完整分析与 wire 契约在 [`graph/README.md`](graph/README.md)「实现要点」。
+
+**视觉编码的定稿依据来自探针**。在决定要不要做成插件之前，先用这个把半径画什么、
+亮度画什么、四类边怎么区分、默认该不该显示 dormant 定下来：
+
+```bash
+node tools/make-snapshot.mjs            # 写 tools/snapshot.sample.json（480 节点）
+node tools/make-snapshot.mjs --nodes 5000   # 压最坏规模
+python -m http.server 8787              # 在 tools/ 下执行，然后开
+# http://localhost:8787/graph-lab.html
+```
+
+`graph-lab.html` 是单页、无构建、双击即用：同目录有 `force-graph.min.js` 就走本地，
+没有才回落 CDN；也可以直接把 json 拖进窗口。
+
+**渲染成星图**：深空底色 + 每簇一团极淡星云，节点是带光晕的星点（叠加混合，越密越亮），
+枢纽带十字星芒，孤点画成空心，连线是发丝级的星座线（causal / temporal 选中时才出箭头）。
+
+**布局按主题分簇**：节点按 `tags` 里的 `topic:` 归组，每组一个向日葵排布的锚点，
+再加一道向锚点收拢的自定义力；跨主题的边放松到 110，簇内拉紧到 16。
+效果是「一眼看出这是几团」，而不是一团均匀的毛球。
+
+**过滤只改可见性，不重排布局**——强度滑杆、档位/类型/关系勾选走的都是
+`nodeVisibility` / `linkVisibility`，改了不动力仿真，用户的空间记忆不会被洗掉。
+
+左上角那行自检按**屏幕半径**算：当前缩放下有多少颗星小于 2px（480 节点、适配缩放 0.96
+时是 228 颗）。它们点得到（命中按 7 屏幕像素算），但看不清——这是编码选错或缩放太远的
+直接证据。窄窗口下侧栏默认收起，点右上角「控制」展开。
+
+数据约定见 [`tools/graph-snapshot.md`](tools/graph-snapshot.md)。探针只消费、不产出，
+与 `simulate.py` 同为设计期工具，不进 CI、不随包分发。
+
+### 想在自己的库上先看看效果
+
+库里没记忆时面板是空的。`tools/seed-store.mjs` 可以把 `make-snapshot.mjs` 的产物灌进
+真实存储，只看效果、不涉及逻辑：
+
+```bash
+node tools/seed-store.mjs --nodes 420   # 灌 420 节点 / 约 1400 边
+node tools/seed-store.mjs --clear       # 用完清掉（务必执行）
+```
+
+⚠ 它写的是 `~/.dsh/storages/memory_hybrid.sqlite`，也就是你**真实的记忆库**，会覆盖同名
+记录。**用完必须 `--clear`，且清完要重启 dsh** —— 插件在进程内缓存快照，运行期直接改库
+不会被感知，「刷新」拿回的还是旧数据。
 
 ---
 

@@ -1,0 +1,1442 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>记忆图谱 · 视觉编码探针</title>
+
+<!--
+  用法：
+    1) 双击打开 → 会尝试 fetch 同目录的 snapshot.sample.json；file:// 下大概率被拦。
+       此时把 json 拖进窗口即可。
+    2) 推荐：在本目录跑 `python -m http.server 8787`，浏览器开 http://localhost:8787/graph-lab.html
+    3) 样本由 `node make-snapshot.mjs` 生成，参数见该脚本头部。
+
+  这个页面的唯一目的：在写进插件之前，回答「这套编码在真实分布下读不读得懂」。
+  所以它刻意提供多个可切换的映射（半径/淡出/配色/边），并在左上角实时统计
+  有多少节点在当前缩放下小到看不清 —— 那是这类图最常见的隐性失败。
+-->
+
+<style>
+  :root {
+    --bg: #0d1014;
+    --panel: #12161d;
+    --panel-2: #1b212a;
+    --line: #262d38;
+    --text: #d7dce4;
+    --muted: #8a93a0;
+    --accent: #5DCAA5;
+    --warn: #EF9F27;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    /* 深空底：几团极淡的星云 + 近黑底色。canvas 保持透明，靠这层透上来，
+       比在画布里每帧画渐变便宜得多。 */
+    background:
+      radial-gradient(1100px 680px at 18% 10%, rgba(64, 92, 170, .16), transparent 62%),
+      radial-gradient(900px 620px at 84% 82%, rgba(122, 74, 170, .13), transparent 60%),
+      radial-gradient(760px 520px at 58% 44%, rgba(38, 118, 140, .10), transparent 66%),
+      #05070d;
+    color: var(--text);
+    font: 13px/1.55 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 8px 12px 8px 16px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    flex: 0 0 auto;
+  }
+  header h1 { font-size: 14px; font-weight: 500; margin: 0; white-space: nowrap; }
+  header .meta { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  header .meta b { color: var(--text); font-weight: 500; }
+  header .spacer { flex: 1; }
+
+  button.btn {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+    font: inherit;
+    white-space: nowrap;
+  }
+  button.btn:hover { border-color: #3b4757; }
+
+  #stage { position: relative; flex: 1 1 auto; display: flex; min-height: 0; }
+  /* overflow:hidden 是必需的：canvas 由渲染库自己定尺寸并绝对定位，
+     一旦它测到的宽度偏大，就会盖到右侧控制栏上（实测过，整页只剩标题）。 */
+  #graph { flex: 1 1 auto; min-width: 0; position: relative; overflow: hidden; }
+  #canvas-host { position: absolute; inset: 0; background: transparent; }
+  /* 暗角：把视线压向中心，是「星图」而不是「数据图」的关键一半 */
+  #graph::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 1;
+    background: radial-gradient(ellipse at 50% 48%, transparent 58%, rgba(2, 4, 9, .5) 100%);
+  }
+  #graph canvas { display: block; }
+
+  aside {
+    flex: 0 0 248px;
+    border-left: 1px solid var(--line);
+    background: var(--panel);
+    overflow-y: auto;
+    scrollbar-color: #3b4757 transparent;
+    scrollbar-width: thin;
+    padding: 12px 14px 20px;
+  }
+  aside[hidden] { display: none; }
+  aside h2 {
+    font-size: 11px;
+    letter-spacing: .08em;
+    color: var(--muted);
+    font-weight: 500;
+    margin: 16px 0 6px;
+  }
+  aside h2:first-child { margin-top: 0; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 3px 0; min-height: 22px; }
+  .row label { flex: 1 1 auto; cursor: pointer; display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .row .count { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+  .field { display: grid; grid-template-columns: 44px 1fr; align-items: center; gap: 8px; margin: 5px 0; }
+  .field > span { color: var(--muted); font-size: 12px; }
+  input[type=checkbox] { accent-color: var(--accent); margin: 0; }
+  input[type=range] { accent-color: var(--accent); width: 100%; margin: 0; }
+  input[type=search], select {
+    width: 100%;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font: inherit;
+    outline: none;
+    min-width: 0;
+  }
+  input[type=search]:focus, select:focus { border-color: #3b4757; }
+  select { cursor: pointer; }
+  .hint { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  #q-count { display: block; min-height: 18px; margin-top: 4px; }
+  .swatch {
+    width: 9px; height: 9px; border-radius: 50%;
+    flex: 0 0 auto; display: inline-block;
+  }
+  .dash {
+    width: 18px; height: 0; flex: 0 0 auto;
+    border-top: 2px solid; display: inline-block;
+  }
+  .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+  #detail {
+    position: absolute;
+    left: 14px; bottom: 14px;
+    width: 320px;
+    max-width: calc(100% - 28px);
+    max-height: min(62%, calc(100% - 110px));
+    overflow-y: auto;
+    scrollbar-color: #3b4757 transparent;
+    scrollbar-width: thin;
+    background: rgba(18, 22, 29, .96);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 12px 14px;
+    backdrop-filter: blur(6px);
+  }
+  #detail[hidden] { display: none; }
+  #ledger, #drop, #detail { z-index: 2; }
+  #detail .txt { font-size: 13px; line-height: 1.6; margin: 0 16px 8px 0; }
+  #detail .chips { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-bottom: 10px; }
+  #detail .chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 0 6px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  #detail .gauge { display: grid; grid-template-columns: 58px 1fr 44px; align-items: center; gap: 8px; font-size: 12px; margin: 3px 0; }
+  #detail .gauge > span:first-child { color: var(--muted); }
+  #detail .gauge > span:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  #detail .bar { height: 4px; border-radius: 2px; background: var(--panel-2); overflow: hidden; }
+  #detail .bar i { display: block; height: 100%; border-radius: 2px; }
+  #detail dl {
+    display: grid;
+    grid-template-columns: auto 1fr auto 1fr;
+    gap: 2px 8px;
+    margin: 8px 0 0;
+    font-size: 12px;
+  }
+  #detail dt { color: var(--muted); }
+  #detail dd { margin: 0; font-variant-numeric: tabular-nums; }
+  #detail .close {
+    position: absolute; top: 8px; right: 10px;
+    background: none; border: 0; color: var(--muted);
+    cursor: pointer; font-size: 15px; line-height: 1;
+  }
+  #detail h3 { font-size: 11px; font-weight: 500; color: var(--muted); margin: 12px 0 4px; }
+  #detail .nbr {
+    display: grid; grid-template-columns: 14px 12px 1fr; align-items: center; gap: 6px;
+    width: 100%;
+    background: none; border: 0; border-radius: 4px;
+    padding: 3px 4px;
+    color: var(--text); font: inherit; font-size: 12px; text-align: left;
+    cursor: pointer;
+  }
+  #detail .nbr:hover { background: var(--panel-2); }
+  #detail .nbr .dash { width: 14px; }
+  #detail .nbr .dir { color: var(--muted); }
+  #detail .nbr .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #detail .nbr.quiet .t { color: var(--muted); }
+
+  #ledger {
+    position: absolute;
+    left: 14px; top: 12px;
+    font-size: 11.5px;
+    color: var(--muted);
+    background: rgba(13, 16, 20, .72);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 5px 10px;
+    pointer-events: none;
+    line-height: 1.7;
+    font-variant-numeric: tabular-nums;
+  }
+  #ledger b { color: var(--text); font-weight: 500; }
+  #ledger .bad { color: var(--warn); }
+
+  #drop {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 10px;
+    text-align: center;
+    color: var(--muted);
+    pointer-events: none;
+    padding: 40px;
+  }
+  #drop.hidden { display: none; }
+  #drop code {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 2px 6px;
+    color: var(--text);
+  }
+  body.dragging #graph { outline: 1px dashed #3b4757; outline-offset: -8px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>记忆图谱 · 视觉编码探针</h1>
+  <span class="meta" id="meta">未载入数据</span>
+  <span class="spacer"></span>
+  <span class="meta" id="libstat"></span>
+  <button class="btn" id="toggle-aside">控制</button>
+</header>
+
+<div id="stage">
+  <div id="graph">
+    <!--
+      渲染库的容器必须单独一层：force-graph 初始化时会清空传入容器再插 canvas，
+      把 #ledger / #drop / #detail 放在同一层会被一起清掉（实测：整个左侧只剩黑底，
+      连「拖文件到这里」的提示都没了，看起来像 CSS 崩了）。
+    -->
+    <div id="canvas-host"></div>
+    <div id="ledger" hidden></div>
+    <div id="drop">
+      <div>把 snapshot.json 拖到这里</div>
+      <div>
+        或在本目录执行 <code>python -m http.server 8787</code> 后访问
+        <code>http://localhost:8787/graph-lab.html</code>
+      </div>
+      <div>样本生成：<code>node make-snapshot.mjs</code></div>
+    </div>
+    <div id="detail" hidden>
+      <button class="close" id="detail-close" title="关闭">×</button>
+      <div id="detail-body"></div>
+    </div>
+  </div>
+
+  <aside id="aside">
+    <h2>搜索</h2>
+    <input type="search" id="q" placeholder="文本 / tag，回车逐个定位">
+    <span class="hint" id="q-count"></span>
+
+    <h2>档位</h2>
+    <div id="tier-filter"></div>
+
+    <h2>类型</h2>
+    <div id="kind-filter"></div>
+
+    <h2>关系</h2>
+    <div id="rel-filter"></div>
+    <div class="field" style="grid-template-columns:1fr 34px;margin-top:8px">
+      <input type="range" id="wmin" min="0" max="0.6" step="0.02" value="0.30" aria-label="连线强度下限">
+      <span id="wmin-hint">≥ .30</span>
+    </div>
+
+    <h2>编码</h2>
+    <label class="field"><span>半径</span>
+      <select id="radius">
+        <option value="strength">强度 imp × R</option>
+        <option value="importance">importance</option>
+        <option value="degree">连接数</option>
+      </select>
+    </label>
+    <label class="field"><span>淡出</span>
+      <select id="fade">
+        <option value="tier">按档位</option>
+        <option value="retention">按 R 连续</option>
+        <option value="none">不淡出</option>
+      </select>
+    </label>
+    <label class="field"><span>配色</span>
+      <select id="colorby">
+        <option value="kind">类型 kind</option>
+        <option value="tier">档位 tier</option>
+      </select>
+    </label>
+    <label class="field"><span>连线</span>
+      <select id="edges">
+        <option value="rel">按关系</option>
+        <option value="weight">按权重</option>
+        <option value="off">不画</option>
+      </select>
+    </label>
+    <label class="field"><span>标签</span>
+      <select id="labels">
+        <option value="auto">随缩放</option>
+        <option value="off">仅悬停</option>
+        <option value="all">尽量全部</option>
+      </select>
+    </label>
+
+    <h2>视图</h2>
+    <div class="btn-row">
+      <button class="btn" id="fit">适配</button>
+      <button class="btn" id="reheat">重新收敛</button>
+    </div>
+  </aside>
+</div>
+
+<script>
+/**
+ * force-graph 走动态插入，而不是 <script src> 同步加载。
+ *
+ * 原因（实测）：同步脚本会阻塞首帧，CDN 不通时整页停在空白 —— 连侧栏都不画，
+ * 只剩一行标题，看起来像布局写错了。改成动态加载 + 超时兜底后，离线也能看到
+ * 完整骨架和一个明确的失败提示。
+ */
+function startLab() {
+  "use strict";
+
+  const TAU = Math.PI * 2;
+
+  /**
+   * 星图配色。
+   *
+   * 四类记忆对应四种「光谱型」：冷紫、青绿、琥珀、品红 —— 都取高明度低饱和，
+   * 因为节点用叠加混合绘制，颜色本身就偏亮，再用饱和色会糊成一团白。
+   */
+  const KIND = {
+    episodic:   { color: "#9B8CFF", label: "episodic 情节" },
+    semantic:   { color: "#58E3C0", label: "semantic 语义" },
+    procedural: { color: "#FFB75E", label: "procedural 程序" },
+    preference: { color: "#FF8FBE", label: "preference 偏好" },
+  };
+  /**
+   * 连线色。alpha 是这条关系默认抢多少视线：related 占七成以上，是底噪；
+   * contradicts 最少也最值得看（两条记忆打架），一眼就要能挑出来。
+   */
+  const REL = {
+    related:     { color: "#6E86AE", dash: null,   alpha: 0.20, label: "related 相关" },
+    causal:      { color: "#5FA8FF", dash: null,   alpha: 0.42, label: "causal 因果" },
+    temporal:    { color: "#D9A066", dash: [3, 3], alpha: 0.42, label: "temporal 时序" },
+    contradicts: { color: "#FF6B6B", dash: [5, 3], alpha: 0.85, label: "contradicts 冲突" },
+  };
+  /** causal / temporal 有方向，选中时才画箭头 —— 平时画满屏箭头只是噪声。 */
+  const DIRECTED = new Set(["causal", "temporal"]);
+  const TIER = {
+    active:  { color: "#7CF0C8", label: "active 在册" },
+    long:    { color: "#6FB1FF", label: "long 长期" },
+    dormant: { color: "#7C8AA8", label: "dormant 沉睡" },
+  };
+
+  const state = {
+    snap: null,
+    radius: "strength",
+    fade: "tier",
+    colorBy: "kind",
+    edgeMode: "rel",
+    // 默认只留较强的边：全部画出来是一张网，不是星座
+    minWeight: 0.30,
+    labels: "auto",
+    tiers: new Set(),
+    kinds: new Set(),
+    rels: new Set(),
+    query: "",
+    hits: [],
+    hitIndex: -1,
+    selected: null,
+    hovered: null,
+    neighbor: new Set(),
+    byId: new Map(),
+    adj: new Map(),
+    groups: new Map(),
+    ranked: [],
+    hubDegree: 10,
+    edgeDensity: 1,
+  };
+
+  const $ = (s) => document.querySelector(s);
+  const hexA = (hex, a) => {
+    const n = parseInt(hex.slice(1), 16);
+    return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+  };
+  const fmtDate = (ms) => {
+    if (!ms) return "—";
+    const d = new Date(ms);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  };
+  const clamp01 = (v) => Math.max(0, Math.min(1, v || 0));
+  const count = (arr, key) => {
+    const out = {};
+    for (const x of arr) out[x[key]] = (out[x[key]] || 0) + 1;
+    return out;
+  };
+
+  /* ---------------------------------------------------------------- *
+   * 编码函数 —— 探针要比较的就是这几个式子
+   * ---------------------------------------------------------------- */
+
+  /**
+   * 半径（世界单位）。
+   *
+   * 数值比「散点图」时代小一个量级：星点外面还套着 3 倍的光晕，而且走叠加混合，
+   * 半径 7 的星在 480 个点的密度下会直接把画面糊成白团（实测过一版就是全白）。
+   * 这里保持 1–5 的窄区间，让差别体现在光晕强度上而不是面积上。
+   */
+  const RADIUS = {
+    strength: (n) => 1.5 + 6.2 * Math.sqrt(Math.max(0, n.weight || 0)),
+    importance: (n) => 1.5 + 4.6 * (n.importance || 0.2),
+    degree: (n) => 1.5 + 2.2 * Math.sqrt(n.degree || 0),
+  };
+  /** 屏幕上不小于这个半径：再暗也得是一个「点」，缩小时才不会整片消失。 */
+  const MIN_SCREEN_R = 1.1;
+
+  const radiusOf = (n) => RADIUS[state.radius](n);
+
+  const alphaOf = (n) => {
+    if (state.fade === "none") return 1;
+    if (state.fade === "tier") return n.tier === "dormant" ? 0.3 : 1;
+    return 0.14 + 0.86 * clamp01(n.retention);
+  };
+
+  /** 按档位淡出时 dormant 退成背景尘埃：真实库可能 97% 是它，不能和活跃记忆抢色。 */
+  const isDust = (n) => state.fade === "tier" && n.tier === "dormant";
+
+  const colorOf = (n) => {
+    if (state.colorBy === "tier") return (TIER[n.tier] || {}).color || "#888888";
+    if (isDust(n)) return TIER.dormant.color;
+    return (KIND[n.kind] || {}).color || "#888888";
+  };
+
+  const matches = (n) => {
+    const q = state.query.trim().toLowerCase();
+    if (!q) return true;
+    return n.text.toLowerCase().includes(q) ||
+      n.tags.some((t) => t.toLowerCase().includes(q));
+  };
+
+  const nodeShown = (n) => state.tiers.has(n.tier) && state.kinds.has(n.kind);
+
+  /** 选中时：自己 2 / 邻居 1 / 其余 0；没选中时搜索命中 1 / 未命中 0；都没有则 -1。 */
+  function focusLevel(n) {
+    if (state.selected) return n === state.selected ? 2 : state.neighbor.has(n.id) ? 1 : 0;
+    if (state.query.trim()) return matches(n) ? 1 : 0;
+    return -1;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * 图
+   * ---------------------------------------------------------------- */
+
+  const el = $("#canvas-host");
+  const lib = window.ForceGraph;
+  if (!lib) {
+    $("#libstat").textContent = "渲染库未加载（离线？）";
+    $("#drop").innerHTML = "<div>force-graph 未能从 CDN 加载，检查网络后刷新。</div>";
+    return;
+  }
+
+  const G = lib()(el)
+    .nodeId("id")
+    // ⚠ 库默认读 link.source / link.target，而快照约定用的是 from / to。
+    //   不显式指定的话，连线一条都画不出来、布局也退化成纯斥力扩散
+    //   （表现为「星点是散开的球，没有团块」），而且全程不报错。
+    .linkSource("from")
+    .linkTarget("to")
+    // 画布透明：深空底色由 CSS 提供（见 body 的星云渐变），
+    // 这样背景不参与每帧重绘，缩放拖拽时也不会跟着抖。
+    .backgroundColor("rgba(0,0,0,0)")
+    .nodeCanvasObjectMode(() => "replace")
+    .nodeCanvasObject(drawNode)
+    // 过滤只影响显示，不进 graphData：布局始终按全量边算，
+    // 否则拖一下强度滑块整张图就重新洗牌，用户的空间记忆全废（约定 §6）。
+    .nodeVisibility(nodeShown)
+    .linkVisibility(linkShown)
+    .nodePointerAreaPaint((node, color, ctx, scale) => {
+      // 命中半径按屏幕像素定下限，不随缩放膨胀：
+      // 用世界单位的话放大 12 倍后一颗星的命中区有 120px，悬停全是错的。
+      const r = Math.max(7 / scale, radiusOf(node) * 1.2);
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, r, 0, TAU);
+      ctx.fill();
+    })
+    // 2D 版 force-graph 不支持 linkCanvasObject：库里只有节点绘制有
+    // "replace" 分支，连线走的是内置管线。曾按文档接了自定义回调，
+    // 结果一条线都画不出来，且不报错 —— 只能用 linkColor/linkWidth 这组。
+    .linkColor(linkColor)
+    .linkWidth(linkWidth)
+    .linkLineDash(linkDash)
+    .linkDirectionalArrowLength((l) => (isSelectedLink(l) && DIRECTED.has(l.rel) ? 5 : 0))
+    .linkDirectionalArrowRelPos(0.92)
+    .enableZoomInteraction(true)
+    .enablePanInteraction(true)
+    .enableNodeDrag(true)
+    .minZoom(0.2)
+    .maxZoom(12)
+    .onNodeHover((n) => {
+      state.hovered = n;
+      el.style.cursor = n ? "pointer" : "default";
+      redraw();
+    })
+    .onZoomEnd(() => updateLedger())
+    .onRenderFramePre(drawNebulae)
+    .onRenderFramePost(drawLabels)
+    .d3AlphaDecay(0.034)
+    .d3VelocityDecay(0.34);
+
+  /**
+   * 自己接管点击命中。
+   *
+   * 库自带的 onNodeClick 依赖它内部的 mousedown/mouseup 配对判定，实测在
+   * 合成事件下不触发（真实拖动又会被判成 drag），而「点星看邻居」是这张图
+   * 唯一的交互入口，不能靠运气。这里按屏幕坐标换算回图坐标，取最近的星，
+   * 阈值用 14 屏幕像素 —— 与缩放无关，缩小时也不会点空。
+   */
+  function bindClick() {
+    const canvas = el.querySelector("canvas");
+    if (!canvas) { setTimeout(bindClick, 120); return; }
+
+    let downAt = null;
+    let dragged = false;
+
+    canvas.addEventListener("pointerdown", (e) => {
+      downAt = { x: e.clientX, y: e.clientY };
+      dragged = false;
+    });
+    canvas.addEventListener("pointermove", (e) => {
+      if (downAt && Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) > 4) dragged = true;
+    });
+    canvas.addEventListener("pointerup", (e) => {
+      const start = downAt;
+      downAt = null;
+      if (!start || dragged || !state.snap) return;
+
+      const rect = canvas.getBoundingClientRect();
+      const p = G.screen2GraphCoords(e.clientX - rect.left, e.clientY - rect.top);
+      const limit = 14 / (G.zoom() || 1);
+
+      let best = null;
+      let bestD = Infinity;
+      for (const n of state.snap.nodes) {
+        if (!nodeShown(n) || !Number.isFinite(n.x)) continue;
+        const d = Math.hypot(n.x - p.x, n.y - p.y);
+        if (d < bestD) { bestD = d; best = n; }
+      }
+      select(best && bestD <= limit ? best : null);
+    });
+  }
+  bindClick();
+
+  /**
+   * 显式喂尺寸，不依赖库自己测量。
+   *
+   * 实测：force-graph 首次初始化时对绝对定位容器量到 0×0，之后也不会自愈，
+   * 画布永远是 0×0 —— 界面上表现为「统计都出来了，但一片黑」。
+   * 自己量 + ResizeObserver 跟随，两条路径都不会踩到这个坑。
+   */
+  const host = el;
+  function fitCanvas() {
+    const r = host.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) {
+      G.width(Math.round(r.width)).height(Math.round(r.height));
+    }
+  }
+  fitCanvas();
+  if (typeof ResizeObserver === "function") new ResizeObserver(fitCanvas).observe(host);
+
+  /* 取景分两次：warmup 算完后的第一个 tick 立刻定位，收敛结束再平滑修正一次。
+     只在 stop 时取景的话，引擎空转那几秒视图停在原点附近，看起来像「图跑了」；
+     warmup 跑在库的异步 digest 里，apply() 同步调 zoomToFit 时坐标还不存在。 */
+  let fitPending = 0;
+  const fitView = (ms) => {
+    try { G.zoomToFit(ms, 48, nodeShown); } catch { /* 旧版本无此方法 */ }
+  };
+
+  G.onEngineTick(() => {
+    if (fitPending === 2) { fitPending = 1; fitView(0); }
+  });
+  G.onEngineStop(() => {
+    if (fitPending) { fitPending = 0; fitView(400); }
+    updateLedger();
+  });
+
+  /* ------------------------------------------------------------------ *
+   * 星点与星光
+   * ------------------------------------------------------------------ *
+   * 用离屏精灵而不是每帧 createRadialGradient：480 个节点 × 每帧一个渐变对象，
+   * 在指针移动时（force-graph 每次 hover 都会重绘）会明显掉帧。
+   * 精灵按颜色缓存，绘制时只做一次 drawImage 缩放。
+   */
+  const SPRITE = 128;
+  const starSprites = new Map();
+
+  function starSprite(color) {
+    const hit = starSprites.get(color);
+    if (hit) return hit;
+    const c = document.createElement("canvas");
+    c.width = c.height = SPRITE;
+    const g = c.getContext("2d");
+    const m = SPRITE / 2;
+    const grad = g.createRadialGradient(m, m, 0, m, m, m);
+    grad.addColorStop(0.00, hexA(color, 0.95));
+    grad.addColorStop(0.20, hexA(color, 0.62));
+    grad.addColorStop(0.42, hexA(color, 0.18));
+    grad.addColorStop(0.72, hexA(color, 0.04));
+    grad.addColorStop(1.00, hexA(color, 0));
+    g.fillStyle = grad;
+    g.fillRect(0, 0, SPRITE, SPRITE);
+    starSprites.set(color, c);
+    return c;
+  }
+
+  /** 星核色：往白偏，但必须留住色相。纯白星核会把类型色整个盖掉，四类看着一模一样。 */
+  const coreColors = new Map();
+  function coreColor(color) {
+    let c = coreColors.get(color);
+    if (!c) {
+      const n = parseInt(color.slice(1), 16);
+      const mix = (v) => Math.round(v + (255 - v) * 0.4);
+      c = `rgb(${mix((n >> 16) & 255)},${mix((n >> 8) & 255)},${mix(n & 255)})`;
+      coreColors.set(color, c);
+    }
+    return c;
+  }
+
+  /**
+   * 一颗星。
+   *
+   * 四层：外发光（精灵）→ 星核 → 星芒（仅枢纽）→ 选中/悬停的光环。
+   * 光晕走 lighter 叠加：重叠处自然提亮 —— 这就是「星空」和「散点图」的分界。
+   * 尘埃（dormant）只有一颗小核、没有光晕：它们数量最多，一旦发光就成了雾。
+   * 孤点画成空心：没有任何连接这件事本身就是信息，而不是靠位置猜。
+   */
+  function drawNode(node, ctx, scale) {
+    if (!Number.isFinite(node.x) || !Number.isFinite(node.y)) return;
+
+    const focus = focusLevel(node);
+    const isSel = focus === 2 && node === state.selected;
+    const isHover = node === state.hovered;
+    // 被聚焦的星不再淡出：dormant 邻居按原值画几乎看不见，
+    // 而「这条记忆连着一条快忘掉的旧记忆」恰恰是点开它想看的。
+    const a = focus === 0 ? 0.07 : focus > 0 || isHover ? 1 : alphaOf(node);
+    const dust = isDust(node) && focus <= 0 && !isHover;
+
+    const r = Math.max(radiusOf(node), MIN_SCREEN_R / scale);
+    const color = focus > 0 || isHover ? (KIND[node.kind] || {}).color || colorOf(node) : colorOf(node);
+    const isolated = (node.degree || 0) === 0;
+
+    // 光晕随屏上半径收掉：缩到星只有一两个像素时，几千团光晕叠加只会过曝成一片白
+    const halo = focus > 0 || isHover ? 1 : clamp01((radiusOf(node) * scale - 0.7) / 1.3);
+
+    ctx.save();
+    if (!dust && halo > 0) {
+      ctx.globalCompositeOperation = "lighter";
+      ctx.globalAlpha = a * 0.5 * halo;
+      const reach = r * (isSel ? 4.6 : 3.2);
+      ctx.drawImage(starSprite(color), node.x - reach, node.y - reach, reach * 2, reach * 2);
+      ctx.globalCompositeOperation = "source-over";
+    }
+
+    ctx.globalAlpha = a;
+    const core = dust ? r : Math.max(MIN_SCREEN_R / scale, r * 0.5);
+    ctx.beginPath();
+    ctx.arc(node.x, node.y, core, 0, TAU);
+    if (isolated) {
+      ctx.strokeStyle = coreColor(color);
+      ctx.lineWidth = 1 / scale;
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = dust ? color : coreColor(color);
+      ctx.fill();
+    }
+
+    // 星芒只给枢纽：满屏十字会立刻变成「特效」，而不是「星图」
+    const deg = node.degree || 0;
+    if (!dust && deg >= state.hubDegree && a > 0.12) {
+      const len = r * (1.4 + Math.min(2.6, deg / 24));
+      ctx.globalAlpha = a * 0.55;
+      ctx.strokeStyle = coreColor(color);
+      ctx.lineWidth = 0.7 / scale;
+      ctx.beginPath();
+      ctx.moveTo(node.x - len, node.y);
+      ctx.lineTo(node.x + len, node.y);
+      ctx.moveTo(node.x, node.y - len);
+      ctx.lineTo(node.x, node.y + len);
+      ctx.stroke();
+    }
+
+    if (isSel || isHover) {
+      ctx.globalAlpha = 0.9;
+      ctx.strokeStyle = "rgb(214,232,255)";
+      ctx.lineWidth = 1 / scale;
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, r + 4 / scale, 0, TAU);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 主题星云与标签
+   * ------------------------------------------------------------------ *
+   * 都放在帧回调里画，而不是 nodeCanvasObject：后者逐节点调用，后画的星会压住
+   * 先画的字，标签之间也没有全局视角，做不了避让。
+   */
+
+  /** 当前可见节点按分组算质心与离散度。每帧 O(n)，5000 点也只是一次线性扫描。 */
+  function groupStats() {
+    const acc = new Map();
+    for (const n of state.snap.nodes) {
+      if (!n.group || !nodeShown(n) || !Number.isFinite(n.x)) continue;
+      const g = acc.get(n.group) || { name: n.group, sx: 0, sy: 0, c: 0, spread: 0 };
+      g.sx += n.x; g.sy += n.y; g.c += 1;
+      acc.set(n.group, g);
+    }
+    for (const g of acc.values()) { g.x = g.sx / g.c; g.y = g.sy / g.c; }
+    for (const n of state.snap.nodes) {
+      const g = n.group && nodeShown(n) && Number.isFinite(n.x) ? acc.get(n.group) : null;
+      if (g) g.spread += (n.x - g.x) ** 2 + (n.y - g.y) ** 2;
+    }
+    for (const g of acc.values()) g.r = Math.sqrt(g.spread / g.c);
+    return [...acc.values()].filter((g) => g.c >= 3);
+  }
+
+  /** 每个主题垫一团极淡的光：不增加信息量，只是让「这一片是一伙的」不用数点就能看出来。 */
+  function drawNebulae(ctx) {
+    if (!state.snap) return;
+    const dim = state.selected || state.query.trim() ? 0.35 : 1;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (const g of groupStats()) {
+      const reach = g.r * 1.9;
+      if (!(reach > 0)) continue;
+      const grad = ctx.createRadialGradient(g.x, g.y, 0, g.x, g.y, reach);
+      grad.addColorStop(0, `rgba(120,150,210,${0.10 * dim})`);
+      grad.addColorStop(0.6, `rgba(120,150,210,${0.035 * dim})`);
+      grad.addColorStop(1, "rgba(120,150,210,0)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(g.x, g.y, reach, 0, TAU);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  const LABEL_PX = 11;
+  const labelWidths = new Map();
+  const labelText = (n, max) => (n.text.length > max ? n.text.slice(0, max - 1) + "…" : n.text);
+
+  /** 按 11px 量一次就缓存：measureText 每帧跑几百次是这条路径上最贵的调用。 */
+  function textWidth(ctx, text) {
+    let w = labelWidths.get(text);
+    if (w === undefined) {
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.font = `${LABEL_PX}px system-ui, "Microsoft YaHei", sans-serif`;
+      w = ctx.measureText(text).width;
+      ctx.restore();
+      labelWidths.set(text, w);
+    }
+    return w;
+  }
+
+  /**
+   * 标签随缩放渐进：全图只看主题名和少数枢纽，放大后额度才放开。
+   *
+   * 这里每帧做一次贪心避让。优先级就是遍历顺序（聚焦 > 主题名 > 排名），
+   * 排名是静态的，所以同一视口下标签不会闪；字号按 1/scale 换算，
+   * 屏幕上恒为 11px，放大 12 倍也不会变成一屏大字。
+   */
+  function drawLabels(ctx, scale) {
+    if (!state.snap) return;
+
+    const tl = G.screen2GraphCoords(0, 0);
+    const br = G.screen2GraphCoords(G.width(), G.height());
+    const placed = [];
+    const px = 1 / scale;
+
+    const tryPlace = (x0, y0, x1, y1) => {
+      for (const p of placed) {
+        if (x0 < p[2] && x1 > p[0] && y0 < p[3] && y1 > p[1]) return false;
+      }
+      placed.push([x0, y0, x1, y1]);
+      return true;
+    };
+
+    ctx.save();
+    ctx.textBaseline = "middle";
+    ctx.lineJoin = "round";
+    const font = (size, weight = 400) =>
+      `${weight} ${size * px}px system-ui, "Microsoft YaHei", sans-serif`;
+
+    const drawOne = (n, { max = 22, pill = false, force = false, strong = false } = {}) => {
+      if (!n.text || !Number.isFinite(n.x)) return false;
+      if (n.x < tl.x || n.x > br.x || n.y < tl.y || n.y > br.y) return false;
+      const text = labelText(n, max);
+      const w = textWidth(ctx, text) * px;
+      const gap = Math.max(radiusOf(n), MIN_SCREEN_R * px) + 6 * px;
+      const flip = n.x + gap + w > br.x;
+      const x = flip ? n.x - gap - w : n.x + gap;
+      const h = 15 * px;
+      const ok = tryPlace(x - 3 * px, n.y - h / 2, x + w + 3 * px, n.y + h / 2);
+      if (!ok && !force) return false;
+
+      ctx.font = font(LABEL_PX);
+      ctx.textAlign = "left";
+      if (pill) {
+        ctx.fillStyle = "rgba(12,16,22,.9)";
+        ctx.beginPath();
+        ctx.roundRect(x - 6 * px, n.y - 10 * px, w + 12 * px, 20 * px, 4 * px);
+        ctx.fill();
+      } else {
+        ctx.strokeStyle = "rgba(5,7,13,.85)";
+        ctx.lineWidth = 3 * px;
+        ctx.strokeText(text, x, n.y);
+      }
+      ctx.fillStyle = strong || pill ? "#eaf2ff" : "#b9c8de";
+      ctx.fillText(text, x, n.y);
+      return true;
+    };
+
+    // 聚焦项先占位：选中、悬停永远显示，不参与额度
+    const focused = new Set();
+    for (const n of [state.hovered, state.selected]) {
+      if (n && !focused.has(n) && nodeShown(n)) {
+        drawOne(n, { max: 40, pill: true, force: true });
+        focused.add(n);
+      }
+    }
+
+    // 主题名：只在远景出现，放大到能看清单颗星时让位
+    const groupAlpha = state.selected || state.query.trim() ? 0.25 : clamp01((2.6 - scale) / 1.2);
+    if (groupAlpha > 0.02 && state.labels !== "off") {
+      ctx.font = font(13, 500);
+      ctx.textAlign = "center";
+      ctx.globalAlpha = groupAlpha;
+      for (const g of groupStats()) {
+        const w = ctx.measureText(g.name).width;
+        const y = g.y - g.r * 1.15;
+        if (!tryPlace(g.x - w / 2, y - 9 * px, g.x + w / 2, y + 9 * px)) continue;
+        ctx.strokeStyle = "rgba(5,7,13,.85)";
+        ctx.lineWidth = 3 * px;
+        ctx.strokeText(g.name, g.x, y);
+        ctx.fillStyle = "#c9d6ea";
+        ctx.fillText(g.name, g.x, y);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    if (state.labels !== "off") {
+      const nbrs = state.selected ? state.adj.get(state.selected.id) || [] : [];
+      if (state.selected) {
+        // 选中时只标邻居：强边优先，其他标签都是干扰
+        let budget = 18;
+        for (const a of nbrs) {
+          if (budget <= 0) break;
+          const n = state.byId.get(a.id);
+          if (n && nodeShown(n) && !focused.has(n) && drawOne(n, { strong: true })) budget -= 1;
+        }
+      } else if (state.query.trim()) {
+        let budget = 24;
+        for (const n of state.hits) {
+          if (budget <= 0) break;
+          if (nodeShown(n) && !focused.has(n) && drawOne(n, { strong: true })) budget -= 1;
+        }
+      } else {
+        // 额度随缩放放开；上限防止 5000 节点时每帧扫完整张表
+        let budget = state.labels === "all" ? 200 : Math.min(40, Math.round(5 * Math.pow(scale, 1.6)) + 2);
+        let scanned = 0;
+        for (const n of state.ranked) {
+          if (budget <= 0 || scanned > 1500) break;
+          scanned += 1;
+          if (state.labels !== "all" && n.tier === "dormant") continue;
+          if (nodeShown(n) && !focused.has(n) && drawOne(n)) budget -= 1;
+        }
+      }
+    }
+    ctx.restore();
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 连线（内置管线的回调）
+   * ------------------------------------------------------------------ *
+   * 颜色管亮度与选中态，宽度管权重，虚线管关系类型。
+   * 走的是普通 alpha 混合，做不出叠加发光 —— 在深色底上细线本身就有星光的错觉，
+   * 比强行加 glow 更稳。库里 lineWidth 会除以当前缩放，这里的宽度是屏幕像素。
+   */
+  const isSelectedLink = (l) =>
+    !!state.selected && (l.fromId === state.selected.id || l.toId === state.selected.id);
+  const isHoveredLink = (l) =>
+    !!state.hovered && (l.fromId === state.hovered.id || l.toId === state.hovered.id);
+
+  function linkShown(l) {
+    if (state.edgeMode === "off" && !isSelectedLink(l) && !isHoveredLink(l)) return false;
+    if (!state.rels.has(l.rel)) return false;
+    const a = state.byId.get(l.fromId);
+    const b = state.byId.get(l.toId);
+    if (!a || !b || !nodeShown(a) || !nodeShown(b)) return false;
+    // 强度下限只管背景疏密：点开一颗星时，它的每条边都必须看得到，
+    // 否则详情面板说有 12 个邻居，图上只连了 5 条。
+    return l.weight >= state.minWeight || isSelectedLink(l) || isHoveredLink(l);
+  }
+
+  function linkColor(l) {
+    const c = state.edgeMode === "rel" ? REL[l.rel] || REL.related : { color: "#8FA3C4", alpha: 0.32 };
+    // 权重分布很窄（九成落在 0.22–0.48），不拉开的话看不出强弱
+    let a = c.alpha * (0.45 + 1.5 * clamp01(l.weight));
+    // 跨主题的桥只占一成多，但线长，亮度一样时面积最大，会把团块连成一片。
+    // 冲突不压：跨主题的矛盾正是最该被看到的那种。
+    if (l.cross && l.rel !== "contradicts") a *= 0.3;
+    // 线跟着两端一起淡：星已退成尘埃、线还全亮的话，dormant 占多数的库只看得见一团线
+    const from = state.byId.get(l.fromId);
+    const to = state.byId.get(l.toId);
+    if (from && to) a *= alphaOf(from) * alphaOf(to);
+    // 边多时整体压暗：单条亮度不变的话，几千条叠起来只剩一片蓝雾
+    a *= state.edgeDensity;
+    if (isSelectedLink(l)) a = 0.95;
+    else if (state.selected) a *= 0.07;
+    else if (isHoveredLink(l)) a = 0.85;
+    else if (state.query.trim()) a *= 0.25;
+    return hexA(c.color, Math.min(1, a));
+  }
+
+  function linkWidth(l) {
+    if (isSelectedLink(l)) return 1 + 2 * clamp01(l.weight);
+    if (isHoveredLink(l)) return 1.2;
+    return 0.5 + 1.1 * clamp01(l.weight);
+  }
+
+  function linkDash(l) {
+    if (state.edgeMode !== "rel") return null;
+    return (REL[l.rel] || REL.related).dash;
+  }
+
+  function redraw() {
+    // 换一个闭包引用，强制 kapsule 触发一次重绘（连线会跟着同一帧重画）
+    G.nodeCanvasObject((n, c, s) => drawNode(n, c, s));
+  }
+
+  /* ---------------------------------------------------------------- *
+   * 选中与邻域
+   * ---------------------------------------------------------------- */
+
+  function select(node) {
+    state.selected = node || null;
+    state.neighbor = new Set();
+    try {
+      if (node) {
+        state.neighbor.add(node.id);
+        for (const a of state.adj.get(node.id) || []) state.neighbor.add(a.id);
+      }
+      renderDetail();
+    } catch (err) {
+      // 详情面板坏了不能让整次点击失效：高亮照做，错误直接写到面板上。
+      // 项目里踩过「空 catch 把三种故障压成同一个现象」的坑，这里显式暴露。
+      console.warn("select failed", err);
+      const box = $("#detail");
+      if (box) {
+        box.hidden = false;
+        const body = $("#detail-body");
+        if (body) body.innerHTML = `<div class="txt">详情渲染失败：${escapeHtml(err.message)}</div>`;
+      }
+    }
+    redraw();
+  }
+
+  const gauge = (label, value, shown, color) =>
+    `<div class="gauge"><span>${label}</span>` +
+    `<span class="bar"><i style="width:${(clamp01(value) * 100).toFixed(1)}%;background:${color}"></i></span>` +
+    `<span>${shown}</span></div>`;
+
+  function renderDetail() {
+    const box = $("#detail");
+    const n = state.selected;
+    if (!n) { box.hidden = true; return; }
+    box.hidden = false;
+    const color = (KIND[n.kind] || {}).color || "#888888";
+
+    const chips = [
+      `<span class="chip"><span class="swatch" style="background:${color}"></span>${escapeHtml(n.kind)}</span>`,
+      `<span class="chip"><span class="swatch" style="background:${(TIER[n.tier] || {}).color || "#888888"}"></span>${escapeHtml(n.tier)}</span>`,
+      ...n.tags.map((t) => `<span class="chip">${escapeHtml(t)}</span>`),
+    ];
+
+    const cells = [
+      ["稳定度", `${n.stability.toFixed(1)} 天`],
+      ["召回", `${n.recallCount} 次`],
+      ["写入", fmtDate(n.createdAt)],
+      ["上次", fmtDate(n.lastRecallAt)],
+    ];
+    if (n.forgotAt) cells.push(["遗忘", fmtDate(n.forgotAt)]);
+
+    const nbrs = state.adj.get(n.id) || [];
+    // 冲突、因果排前面：比「相关」更值得先看
+    const list = [...nbrs].sort((p, q) => relRank(p.rel) - relRank(q.rel) || q.weight - p.weight);
+
+    $("#detail-body").innerHTML =
+      `<div class="txt">${escapeHtml(n.text || "（无文本）")}</div>` +
+      `<div class="chips">${chips.join("")}</div>` +
+      gauge("可召回 R", n.retention, `${(clamp01(n.retention) * 100).toFixed(0)}%`, color) +
+      gauge("importance", n.importance, n.importance.toFixed(2), color) +
+      gauge("imp × R", n.weight, n.weight.toFixed(2), color) +
+      `<dl>${cells.map(([k, v]) => `<dt>${k}</dt><dd>${escapeHtml(String(v))}</dd>`).join("")}</dl>` +
+      (list.length ? `<h3>${list.length} 个邻居</h3>` : "") +
+      list.map((a) => {
+        const m = state.byId.get(a.id);
+        const rel = REL[a.rel] || REL.related;
+        const line = rel.dash ? "dashed" : "solid";
+        const dir = DIRECTED.has(a.rel) ? (a.out ? "→" : "←") : "";
+        return `<button class="nbr${m && m.tier === "dormant" ? " quiet" : ""}" data-id="${escapeHtml(a.id)}" title="${escapeHtml(rel.label)} · ${a.weight.toFixed(2)}">` +
+          `<span class="dash" style="border-top-style:${line};border-color:${rel.color}"></span>` +
+          `<span class="dir">${dir}</span>` +
+          `<span class="t">${escapeHtml(m ? m.text || m.id : a.id)}</span></button>`;
+      }).join("");
+    $("#detail").scrollTop = 0;
+  }
+
+  const relRank = (rel) => ["contradicts", "causal", "temporal", "related"].indexOf(rel);
+
+  $("#detail-body").addEventListener("click", (e) => {
+    const btn = e.target.closest(".nbr");
+    if (!btn) return;
+    const n = state.byId.get(btn.dataset.id);
+    if (!n) return;
+    select(n);
+    if (Number.isFinite(n.x)) G.centerAt(n.x, n.y, 400);
+  });
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+
+  /* ---------------------------------------------------------------- *
+   * 组装图数据
+   * ---------------------------------------------------------------- */
+
+  /** 分组键：优先 topic: 前缀的标签，否则第一个标签。tags 是自由字段，没有就不分组。 */
+  function groupOf(n) {
+    const t = n.tags.find((x) => x.startsWith("topic:")) ?? n.tags[0];
+    return t ? t.replace(/^topic:/, "") : null;
+  }
+
+  /**
+   * 按约定 §5 消化脏数据：缺字段补缺省、悬空边过滤、计数以数组为准。
+   * 不做这一步的话，一条悬空边就会让渲染库在 digest 里抛错，整张图不出来。
+   */
+  function normalize(raw) {
+    const nodes = (Array.isArray(raw.nodes) ? raw.nodes : [])
+      .filter((n) => n && n.id != null)
+      .map((n) => {
+        const importance = n.importance ?? 0.4;
+        const retention = n.retention ?? 1;
+        return {
+          ...n,
+          text: n.text ?? "",
+          kind: n.kind ?? "semantic",
+          tier: n.tier ?? "active",
+          importance,
+          stability: n.stability ?? 3,
+          retention,
+          weight: n.weight ?? importance * retention,
+          recallCount: n.recallCount ?? 0,
+          tags: Array.isArray(n.tags) ? n.tags : [],
+          degree: n.degree ?? 0,
+        };
+      });
+    const ids = new Set(nodes.map((n) => n.id));
+    const edges = (Array.isArray(raw.edges) ? raw.edges : [])
+      .filter((e) => e && ids.has(e.from) && ids.has(e.to))
+      // fromId / toId 留一份字符串：建边后库会把 from/to 换成节点对象
+      .map((e) => ({ ...e, fromId: e.from, toId: e.to, rel: e.rel ?? "related", weight: e.weight ?? 0.2 }));
+    return { ...raw, nodes, edges };
+  }
+
+  /**
+   * 主题簇的锚点：向日葵排布铺满一个圆，按视口宽高比略拉伸。
+   * 取前 12 个主题 —— 再多也分不出来，其余节点只受中心引力。
+   */
+  function placeAnchors(nodes) {
+    const sizes = new Map();
+    for (const n of nodes) {
+      n.group = groupOf(n);
+      if (n.group) sizes.set(n.group, (sizes.get(n.group) || 0) + 1);
+    }
+    const top = [...sizes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([g]) => g);
+    state.groups = new Map();
+    if (top.length < 2) return;
+    const rect = host.getBoundingClientRect();
+    const aspect = rect.height > 0 ? Math.max(1, Math.min(1.7, rect.width / rect.height)) : 1;
+    const R = 13 * Math.sqrt(nodes.length) + 40;
+    top.forEach((g, i) => {
+      const rr = R * Math.sqrt((i + 0.5) / top.length);
+      const th = i * 2.39996;
+      state.groups.set(g, {
+        x: rr * Math.cos(th) * Math.sqrt(aspect),
+        y: rr * Math.sin(th) / Math.sqrt(aspect),
+      });
+    });
+  }
+
+  /** 把节点拉向所属主题的锚点。d3 的自定义力就是一个带 initialize 的函数。 */
+  function anchorForce() {
+    let nodes = [];
+    const force = (alpha) => {
+      for (const n of nodes) {
+        const a = state.groups.get(n.group);
+        const k = (a ? 0.14 : 0.03) * alpha;
+        n.vx += ((a ? a.x : 0) - n.x) * k;
+        n.vy += ((a ? a.y : 0) - n.y) * k;
+      }
+    };
+    force.initialize = (list) => { nodes = list; };
+    return force;
+  }
+
+  /**
+   * 左上角自检：当前缩放下多少星小到看不清、孤点多少、最大枢纽。
+   * 按屏幕半径算而不是世界半径 —— 同一份数据缩放不同，答案本来就不同。
+   */
+  function updateLedger() {
+    if (!state.snap) return;
+    const nodes = state.snap.nodes.filter(nodeShown);
+    const links = state.snap.edges.filter(linkShown);
+    state.edgeDensity = Math.min(1, Math.sqrt(1200 / Math.max(1, links.length)));
+    const zoom = G.zoom() || 1;
+    const tiny = nodes.filter((n) => radiusOf(n) * zoom < 2).length;
+    const isolated = nodes.filter((n) => (n.degree || 0) === 0).length;
+    const hubTop = nodes.reduce((m, n) => Math.max(m, n.degree || 0), 0);
+    const box = $("#ledger");
+    box.hidden = false;
+    box.innerHTML =
+      `<b>${nodes.length}</b> / ${state.snap.nodes.length} 节点 · <b>${links.length}</b> 边 · ` +
+      `孤点 <b>${isolated}</b> · 最大度 <b>${hubTop}</b><br>` +
+      (tiny ? `<span class="bad">${tiny} 颗屏上半径 &lt; 2px</span>` : `全部 ≥ 2px`) +
+      ` · 缩放 <b>${zoom.toFixed(2)}</b>`;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * 载入
+   * ---------------------------------------------------------------- */
+
+  function apply(raw) {
+    const snap = normalize(raw);
+    state.snap = snap;
+
+    const byTier = count(snap.nodes, "tier");
+    const byKind = count(snap.nodes, "kind");
+    const byRel = count(snap.edges, "rel");
+    state.tiers = new Set(Object.keys(byTier));
+    state.kinds = new Set(Object.keys(byKind));
+    state.rels = new Set(Object.keys(byRel));
+    state.counts = { byTier, byKind, byRel };
+
+    // id → 节点 与 邻接表：选中、连线可见性、详情面板都要查，别每次扫边
+    state.byId = new Map(snap.nodes.map((n) => [n.id, n]));
+    state.adj = new Map(snap.nodes.map((n) => [n.id, []]));
+    for (const e of snap.edges) {
+      state.adj.get(e.fromId).push({ id: e.toId, rel: e.rel, weight: e.weight, out: true });
+      if (e.fromId !== e.toId) state.adj.get(e.toId).push({ id: e.fromId, rel: e.rel, weight: e.weight, out: false });
+    }
+    for (const list of state.adj.values()) list.sort((a, b) => b.weight - a.weight);
+
+    // 标签排名：先枢纽、度相同看权重。排名静态，标签才不会随缩放闪烁。
+    state.ranked = [...snap.nodes].sort((a, b) => b.degree - a.degree || b.weight - a.weight);
+    // 星芒阈值取前 5% 的度：固定 10 度在稀疏库里没有枢纽，在稠密库里满屏都是
+    const degrees = snap.nodes.map((n) => n.degree).sort((a, b) => b - a);
+    state.hubDegree = Math.max(6, degrees[Math.floor(degrees.length * 0.05)] || 0);
+
+    state.selected = null;
+    state.hovered = null;
+    state.neighbor = new Set();
+    state.hits = [];
+    state.hitIndex = -1;
+    state.query = "";
+    $("#q").value = "";
+    $("#q-count").textContent = "";
+    labelWidths.clear();
+
+    placeAnchors(snap.nodes);
+    buildFilters();
+    $("#meta").innerHTML =
+      `<b>${snap.nodes.length}</b> 记忆 · <b>${snap.edges.length}</b> 边 · ` +
+      `平均度 <b>${(snap.edges.length * 2 / Math.max(1, snap.nodes.length)).toFixed(2)}</b>`;
+    $("#drop").classList.add("hidden");
+    $("#detail").hidden = true;
+
+    // 力参数必须在 graphData 之前设好：warmup 就在随后的 digest 里跑，
+    // 晚一步的话前 N 个 tick 全是库的默认参数。
+    // 这组是按 480 节点实测的：主题内边拉紧、跨主题边放松（否则桥会把团块扯成一片），
+    // 斥力加距离上限，避免远处的簇互相推开、孤点飞到天边把取景撑大。
+    try {
+      const n = snap.nodes.length;
+      G.d3Force("charge").strength(-Math.max(26, Math.min(60, 26000 / n / 2))).distanceMax(160);
+      G.d3Force("link")
+        .distance((l) => (l.cross ? 110 : 16 + 26 * (1 - clamp01(l.weight))))
+        .strength((l) => (l.cross ? 0.012 : 0.22));
+      G.d3Force("center", null);
+      G.d3Force("anchor", anchorForce());
+      // 主要收敛放在 warmup 里，打开时直接看到成形的图；规模大时缩短以免卡首帧
+      G.warmupTicks(n > 2000 ? 50 : 160);
+      G.cooldownTicks(n > 2000 ? 60 : 90);
+    } catch (e) {
+      console.warn("力参数设置失败（上游 API 变动？）", e);
+    }
+
+    for (const e of snap.edges) {
+      e.cross = state.byId.get(e.fromId).group !== state.byId.get(e.toId).group;
+    }
+
+    fitPending = 2;
+    G.graphData({ nodes: snap.nodes, links: snap.edges });
+    updateLedger();
+  }
+
+  /** 过滤和图例是同一件事：勾选框旁边的色块就是图例，不再单列一份。 */
+  function checkRow(id, mark, label, n, set, key) {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML =
+      `<label for="${id}"><input type="checkbox" id="${id}" ${set.has(key) ? "checked" : ""}>${mark}` +
+      `<span>${escapeHtml(label)}</span></label><span class="count">${n}</span>`;
+    row.querySelector("input").addEventListener("change", (e) => {
+      if (e.target.checked) set.add(key); else set.delete(key);
+      if (state.query.trim()) runSearch();
+      afterFilter();
+    });
+    return row;
+  }
+
+  function buildFilters() {
+    const { byTier, byKind, byRel } = state.counts;
+    const swatch = (c) => `<span class="swatch" style="background:${c}"></span>`;
+
+    const tierBox = $("#tier-filter");
+    tierBox.innerHTML = "";
+    for (const tier of [...Object.keys(TIER), ...Object.keys(byTier).filter((t) => !TIER[t])]) {
+      if (!byTier[tier]) continue;
+      const v = TIER[tier] || { color: "#888888", label: tier };
+      tierBox.appendChild(checkRow(`t-${tier}`, state.colorBy === "tier" ? swatch(v.color) : "", v.label, byTier[tier], state.tiers, tier));
+    }
+
+    const kindBox = $("#kind-filter");
+    kindBox.innerHTML = "";
+    for (const kind of [...Object.keys(KIND), ...Object.keys(byKind).filter((k) => !KIND[k])]) {
+      if (!byKind[kind]) continue;
+      const v = KIND[kind] || { color: "#888888", label: kind };
+      kindBox.appendChild(checkRow(`k-${kind}`, state.colorBy === "kind" ? swatch(v.color) : "", v.label, byKind[kind], state.kinds, kind));
+    }
+
+    const relBox = $("#rel-filter");
+    relBox.innerHTML = "";
+    for (const rel of [...Object.keys(REL), ...Object.keys(byRel).filter((r) => !REL[r])]) {
+      if (!byRel[rel]) continue;
+      const v = REL[rel] || { color: "#888888", label: rel };
+      const mark = `<span class="dash" style="border-top-style:${v.dash ? "dashed" : "solid"};border-color:${v.color}"></span>`;
+      relBox.appendChild(checkRow(`r-${rel}`, mark, v.label, byRel[rel], state.rels, rel));
+    }
+  }
+
+  function afterFilter() {
+    if (state.selected && !nodeShown(state.selected)) select(null);
+    updateLedger();
+    redraw();
+  }
+
+  /* ---------------------------------------------------------------- *
+   * 事件
+   * ---------------------------------------------------------------- */
+
+  $("#radius").addEventListener("change", (e) => { state.radius = e.target.value; afterFilter(); });
+  $("#fade").addEventListener("change", (e) => { state.fade = e.target.value; redraw(); });
+  $("#colorby").addEventListener("change", (e) => {
+    state.colorBy = e.target.value;
+    if (state.snap) buildFilters();
+    redraw();
+  });
+  $("#edges").addEventListener("change", (e) => { state.edgeMode = e.target.value; afterFilter(); });
+  $("#labels").addEventListener("change", (e) => { state.labels = e.target.value; redraw(); });
+
+  const wmin = $("#wmin");
+  wmin.value = String(state.minWeight);
+  const syncWmin = () => {
+    state.minWeight = Number(wmin.value);
+    $("#wmin-hint").textContent = `≥ ${state.minWeight.toFixed(2).replace(/^0/, "")}`;
+    afterFilter();
+  };
+  syncWmin();
+  wmin.addEventListener("input", syncWmin);
+
+  $("#fit").addEventListener("click", () => fitView(400));
+  $("#reheat").addEventListener("click", () => G.d3ReheatSimulation());
+  $("#detail-close").addEventListener("click", () => select(null));
+
+  const aside = $("#aside");
+  // 窄窗口默认收起：248px 的侧栏在 760 以下要吃掉图的三分之一
+  if (window.innerWidth < 760) aside.hidden = true;
+  $("#toggle-aside").addEventListener("click", () => { aside.hidden = !aside.hidden; });
+
+  function runSearch() {
+    state.hits = state.snap && state.query.trim() ? state.snap.nodes.filter((n) => nodeShown(n) && matches(n)) : [];
+    state.hitIndex = -1;
+    state.hovered = null;
+    $("#q-count").textContent = state.query.trim() ? `${state.hits.length} 条命中` : "";
+    if (state.query.trim() && state.selected) select(null);
+    redraw();
+  }
+
+  $("#q").addEventListener("input", (e) => {
+    state.query = e.target.value;
+    runSearch();
+  });
+  $("#q").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || !state.hits.length) return;
+    e.preventDefault();
+    state.hitIndex = (state.hitIndex + 1) % state.hits.length;
+    const n = state.hits[state.hitIndex];
+    $("#q-count").textContent = `${state.hitIndex + 1} / ${state.hits.length}`;
+    state.hovered = n;
+    if (Number.isFinite(n.x)) {
+      G.centerAt(n.x, n.y, 400);
+      if (G.zoom() < 2) G.zoom(2, 400);
+    }
+    redraw();
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") select(null);
+  });
+
+  /* 拖放 / 选择文件 */
+  function readFile(file) {
+    const fr = new FileReader();
+    fr.onload = () => {
+      try {
+        apply(JSON.parse(fr.result));
+        $("#libstat").textContent = file.name;
+      } catch (err) {
+        $("#libstat").textContent = `解析失败：${err.message}`;
+      }
+    };
+    fr.readAsText(file, "utf-8");
+  }
+
+  window.addEventListener("dragover", (e) => { e.preventDefault(); document.body.classList.add("dragging"); });
+  window.addEventListener("dragleave", () => document.body.classList.remove("dragging"));
+  window.addEventListener("drop", (e) => {
+    e.preventDefault();
+    document.body.classList.remove("dragging");
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) readFile(f);
+  });
+
+  /* 自动载入同目录样本。取不到是 file:// 下的常态，渲染出错则不是，两者分开报。 */
+  fetch("./snapshot.sample.json")
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then(
+      (s) => {
+        try {
+          apply(s);
+          $("#libstat").textContent = "snapshot.sample.json";
+        } catch (err) {
+          console.error(err);
+          $("#libstat").textContent = `渲染失败：${err.message}`;
+        }
+      },
+      () => { $("#libstat").textContent = "样本未自动载入（file:// 下正常）"; },
+    );
+}
+
+/* ------------------------------------------------------------------ *
+ * 启动引导
+ * ------------------------------------------------------------------ *
+ * 先找同目录的 force-graph.min.js（可离线、可钉版本），没有再退 CDN。
+ * 顺序反过来会让每次冷启动都先发一个必然打不通的外网请求，在受限网络下
+ * 要等 complete 才报错 —— 本地优先的启动体感明显更好。
+ *
+ * 取本地副本：
+ *   curl -o force-graph.min.js https://unpkg.com/force-graph@1.52.0/dist/force-graph.min.js
+ *   （或 Invoke-WebRequest；文件约 169 KB，已列入 .gitignore，不随仓库分发）
+ */
+
+const SOURCES = [
+  "./force-graph.min.js",
+  "https://unpkg.com/force-graph@1.52.0/dist/force-graph.min.js",
+];
+let booted = false;
+
+function bootFail(msg) {
+  if (booted) return;
+  const stat = document.querySelector("#libstat");
+  const drop = document.querySelector("#drop");
+  if (stat) stat.textContent = msg;
+  if (drop) {
+    drop.classList.remove("hidden");
+    drop.innerHTML =
+      `<div>${msg}</div>` +
+      `<div>探针需要 force-graph。取一份本地副本放到本目录即可离线运行：</div>` +
+      `<div><code>curl -o force-graph.min.js https://unpkg.com/force-graph@1.52.0/dist/force-graph.min.js</code></div>`;
+  }
+}
+
+function loadFrom(i) {
+  if (i >= SOURCES.length) { bootFail("force-graph 加载失败（本地与 CDN 均不可用）"); return; }
+  const s = document.createElement("script");
+  s.src = SOURCES[i];
+  s.onload = () => {
+    if (!window.ForceGraph) { loadFrom(i + 1); return; }
+    booted = true;
+    startLab();
+  };
+  s.onerror = () => loadFrom(i + 1);
+  document.head.appendChild(s);
+}
+
+loadFrom(0);
+setTimeout(() => { if (!booted) bootFail("force-graph 加载超时（10 秒）"); }, 10000);
+</script>
+</body>
+</html>

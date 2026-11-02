@@ -268,6 +268,73 @@ for (const [label, text] of [["根 README", readme], ["plugin README", pluginRea
   );
 }
 
+/* ------------------------------------------------------------------ *
+ * [6] 附属包 graph/ 的自洽与版本纪律
+ * ------------------------------------------------------------------ */
+
+group("附属包 graph/");
+
+const graphPkgPath = resolve(root, "graph", "package.json");
+ok("graph 清单存在", existsSync(graphPkgPath));
+
+const graphPkg = readManifest(graphPkgPath);
+
+eq("graph 包名", graphPkg.name, "dsh-memory-graph");
+ok(
+  "graph 版本号是合法 semver",
+  /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(graphPkg.version),
+  `实际 ${graphPkg.version}`,
+);
+
+// 与核心同规矩：附属包也不能有外部依赖，否则 link: 装法会缺依赖
+for (const field of DEP_FIELDS) {
+  ok(`graph 未声明 ${field}`, graphPkg[field] === undefined);
+}
+
+// 浏览器半与宿主半的入口必须都存在，缺一个就是整块面板静默消失
+ok("graph 宿主入口存在", existsSync(resolve(root, "graph", "src", "index.js")));
+ok("graph 浏览器入口存在", existsSync(resolve(root, "graph", "client.js")));
+eq("graph 浏览器入口声明", graphPkg.dsh?.client?.platform, "web");
+
+/*
+ * `CLIENT_VERSION` 是 client.js 里写死的第二份版本号，只用于底栏那行字。
+ * 它和 package.json 不同步不会报错，只会让用户在界面上看到一个过期的版本 —— 
+ * 排查时按界面上那个版本去翻代码，就会找错位置。所以必须锁死。
+ */
+const clientSrc = readFileSync(resolve(root, "graph", "client.js"), "utf8");
+const clientVerMatch = clientSrc.match(/CLIENT_VERSION\s*=\s*"([^"]+)"/);
+ok("client.js 里找得到 CLIENT_VERSION", Boolean(clientVerMatch), "变量没了就更新这条护栏");
+if (clientVerMatch) {
+  eq("client.js 的 CLIENT_VERSION 与 graph 清单一致", clientVerMatch[1], graphPkg.version);
+}
+
+// 同样的「改了源码没升版本 → 老用户装回旧 commit」问题，附属包也在所难免
+if (hasGit) {
+  const prevGraphRaw = git(["show", "HEAD~1:graph/package.json"]);
+  const prevGraph = prevGraphRaw === undefined ? undefined : JSON.parse(prevGraphRaw);
+
+  if (prevGraph === undefined) {
+    console.log("  · graph/ 上一提交不存在，跳过「版本号是否已升」检查");
+  } else {
+    /*
+     * 只看已提交的区间。当前 graph/ 整个是新目录、尚未进过版本库，
+     * `git diff HEAD~1 HEAD -- graph/` 自然为空，检查会被跳过 —— 
+     * 这是对的：首次提交没有「上一版」可比，不该逼着从 0.0.0 起步。
+     */
+    const gChanged = git(["diff", "--name-only", "HEAD~1", "HEAD", "--", "graph/"]);
+    const gShipped = (gChanged ?? "").split("\n").filter(Boolean);
+    if (gShipped.length === 0) {
+      console.log("  · 上一提交未改动 graph/，无需升版本");
+    } else {
+      ok(
+        "graph/ 有改动，版本号已提升",
+        graphPkg.version !== prevGraph.version,
+        `上一提交 ${prevGraph.version} → 当前 ${graphPkg.version}`,
+      );
+    }
+  }
+}
+
 /* ------------------------------------------------------------------ */
 
 console.log(`\n${"-".repeat(50)}`);

@@ -32,19 +32,16 @@
 ## 目录结构
 
 ```
-dsh-memory/
+dsh-memory-hybrid/
 ├── plugin/                    插件包（可 npm pack 分发）
-│   ├── src/                   16 个模块，另有 src/graph/rpc.js 提供图谱取数通道
+│   ├── src/                   16 个模块
+│   │   └── graph/             图谱数据出口：rpc.js（通道）+ snapshot.js（投影）
 │   ├── client.js              浏览器端：设置页 tab + 侧栏面板（1,046 行）
 │   ├── vendor/sqlite/         内嵌 SQLite wasm 引擎（零外部依赖的关键）
 │   ├── cordis.patch.yml       bundle 补丁，声明插件默认配置
 │   ├── package.json           dsh.bundle.patch 指向上面那个 yml
 │   └── README.md              安装 / 设计 / 调参 / 排查，都在这
-├── graph/                     附属包：记忆星图面板（可选，另装）
-│   ├── client.js              浏览器半：布局 + 绘制 + 交互
-│   ├── src/index.js           宿主半：存在的意义只是让浏览器半进启动图
-│   └── README.md              交互编码 / 装法 / 通道绕行 / 已知限制
-├── test/                      9 个套件（不随 npm 包分发）
+├── test/                      8 个套件（不随 npm 包分发）
 └── tools/
     ├── simulate.py            设计期数值探针（不是测试）
     ├── make-snapshot.mjs      生成图谱样本快照（用真衰减公式）
@@ -52,6 +49,14 @@ dsh-memory/
     ├── graph-lab.html         图谱视觉编码探针（单页，无构建）
     └── graph-snapshot.md      快照数据约定（核心 → 可视化 的只读投影）
 ```
+
+星图**面板**不在本仓库：它是独立的公开库
+[dolou12388/dsh-memory-graph](https://github.com/dolou12388/dsh-memory-graph)
+（包名 `dsh-memory-graph`），有自己的 README 和测试。本仓库只保留「数据出口」——
+`plugin/src/graph/` 把记忆投影成只读快照并通过 RPC 送出去，不关心谁来画。
+
+拆开是为了让渲染代码的每次配色调整都不必触发核心发版；`manifest` 测试里有一条
+反向护栏，防止有人图方便把 `graph/` 又复制回来。
 
 ---
 
@@ -61,10 +66,11 @@ dsh-memory/
 |---|---|
 | **装上并跑起来** | [`plugin/README.md`](plugin/README.md) 第五节「装配」 |
 | **改配置** | 侧边栏「记忆」图标，或 设置 → 插件 → 记忆（同一份配置，两个入口） |
+| **要看记忆星图** | 另装 [dsh-memory-graph](https://github.com/dolou12388/dsh-memory-graph) |
 | 理解衰减/唤醒/心情为什么这样设计 | [`plugin/README.md`](plugin/README.md) 第二~四节 |
 | 改参数，看会影响什么 | [`plugin/README.md`](plugin/README.md) 第十节「调参」 |
 | 排查故障 | [`plugin/README.md`](plugin/README.md) 第九节「已知限制」+ 第十一节「验证」 |
-| 改代码，确认没改坏 | `test/` |
+| 改代码，确认没改坏 | `test/`（8 个套件；面板的测试在 graph 那个仓库） |
 
 ---
 
@@ -197,23 +203,34 @@ python -X utf8 tools/simulate.py
 
 ## 记忆图谱
 
-星图面板已经是**正式附属包 [`graph/`](graph/README.md)**，不再只是设计期探针：
-侧栏多一个「图谱」图标，点开是整库的可交互星图（滚轮缩放、拖背景平移、拖节点改位置、
-点星高亮一跳邻居、详情卡列邻居并可继续跳、按档位过滤、适配/重排/刷新）。
+星图面板是**独立的公开库**：[dolou12388/dsh-memory-graph](https://github.com/dolou12388/dsh-memory-graph)。
+装上后侧栏多一个「图谱」图标，点开是整库的可交互星图（滚轮缩放、拖背景平移、拖节点改
+位置、点星高亮一跳邻居、详情卡列邻居并可继续跳、按档位过滤、适配/重排/刷新）。
 
-装法见 [`graph/README.md`](graph/README.md)「安装」，其中两条最常踩：
+本仓库只负责**数据出口**，不负责渲染。两者的分界：
+
+| 归属 | 内容 |
+|---|---|
+| 本仓库 `plugin/src/graph/` | `rpc.js` 挂通道、`snapshot.js` 把记忆投影成只读快照 |
+| graph 那个仓库 | 布局、绘制、交互、视觉编码 |
+
+装法与坑都在那个仓库的 README 里。两条最常踩的照录如下：
 
 1. **profile 里必须有 `@deepseek-ai/dsh-web-app`。** 只有 `dsh-base` 时 `dsh web`
-   直接退出码 1，且没有任何能指向病因的报错 —— 本条面板挂 `sidebar.panellist`，
+   直接退出码 1，且没有任何能指向病因的报错 —— 面板挂 `sidebar.panellist`，
    没有 web 层就无处可挂，表现成「装好了但看不见」。
 2. **启动不要带 `web` 子命令。** profile 自身即应用，`dsh --profile X web` 报
    `too many arguments`；正确是 `dsh --profile X --no-open --port 8791`，
    然后带上终端打印的 `?token=` 访问（裸开根路径 401 是认证在工作）。
 
-数据只从核心的 RPC 通道 `/memory-hybrid/graph` 拿，本包不二次读库（原因见 graph/README
-「依赖」）。通道是自己挂在 `webServer` 上的前缀路由，不用 `connection.rpc.handle()` ——
-后者的 owner ctx 缺 `webServer` 许可，会把注册错误静默吞掉，症状是面板恒报 405。
-完整分析与 wire 契约在 [`graph/README.md`](graph/README.md)「实现要点」。
+数据只从本仓库的 RPC 通道 `/memory-hybrid/graph` 拿，面板不二次读库 —— 因为
+`storage-domain` 的 domain 名按 facility 占用，同名二次 `open` 会抛 `already-open`，
+直接读 `.sqlite` 更糟（内嵌 wasm 无锁，并发写会烂库）。所以数据只能有一个出口。
+
+通道是自己挂在 `webServer` 上的前缀路由，**不用** `connection.rpc.handle()` ——
+后者内部以 connection 服务自身的 ctx 为 owner 调 `owner.webServer.register(...)`，
+而那个 ctx 没有 `webServer` 许可，注册错误被内部 try 吞掉，症状是面板恒报 405。
+细节与 wire 契约见 [`plugin/src/graph/rpc.js`](plugin/src/graph/rpc.js) 的注释。
 
 **视觉编码的定稿依据来自探针**。在决定要不要做成插件之前，先用这个把半径画什么、
 亮度画什么、四类边怎么区分、默认该不该显示 dormant 定下来：

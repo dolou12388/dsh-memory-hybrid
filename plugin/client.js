@@ -62,6 +62,15 @@ window.__ModuleLoader__.load({
      */
     const NS = "dsh-memory-hybrid";
 
+    /**
+     * 客户端版本号，显示在面板副标题上。
+     *
+     * 存在的唯一理由：区分「代码没改对」与「浏览器没重新加载」。SPA 里切换
+     * 侧栏面板不会重新拉 bundle，服务端改了代码而页面一直开着，界面上是
+     * 看不出区别的 —— 这一行给出确定答案。
+     */
+    const CLIENT_VERSION = "0.2.6";
+
     /* ------------------------------------------------------------------ *
      * 文案
      * ------------------------------------------------------------------ */
@@ -625,8 +634,10 @@ window.__ModuleLoader__.load({
                   whiteSpace: "pre-wrap",
                 },
               },
-              `mode=${d.mode} status=${d.status} own=${d.own ? "y" : "n"}` +
-                (d.error ? `\n${d.error}` : ""),
+              `v${CLIENT_VERSION}  mode=${d.mode} status=${d.status} own=${d.own ? "y" : "n"}\n` +
+                `remote.settings=${d.rs ?? "?"} nested=${d.ns ?? "?"} remote=${d.rm ?? "?"}` +
+                (d.perr ? `\nprobe: ${d.perr}` : "") +
+                (d.error ? `\nscope: ${d.error}` : ""),
             ),
           ],
         );
@@ -818,7 +829,10 @@ window.__ModuleLoader__.load({
                       color: "var(--dsw-alias-label-tertiary)",
                     },
                   },
-                  t("panelDesc"),
+                  // 带上版本号：排查「改了代码但界面没变」时，这一行能一次
+                  // 说清浏览器加载的到底是哪一版 —— 有版本号 = 新代码已生效，
+                  // 没有 = 页面没重新加载（SPA 里切换面板不会重拉 bundle）。
+                  `${t("panelDesc")} · v${CLIENT_VERSION}`,
                 ),
               ],
             ),
@@ -1209,9 +1223,10 @@ window.__ModuleLoader__.load({
        * @param {object} settings `remote.settings` API 对象（不是 `ctx.remote`）
        * @param {object} [hostScope] 宿主的 `configForms.get(NS)`；不可用时自建
        */
-      constructor(ctx, settings, hostScope) {
+      constructor(ctx, settings, hostScope, probe) {
         this.ctx = ctx;
         this.settings = settings;
+        this.probe = probe ?? {};
         this.secrets = { embedApiKey: false, jevApiKey: false };
 
         // 绝大多数部署里宿主 scope 是好的，直接用它 —— 它额外提供
@@ -1279,6 +1294,11 @@ window.__ModuleLoader__.load({
           status: snapshot.status ?? "?",
           own: this.ownScope !== undefined,
           error: this.ownScope?.lastError ?? "",
+          // 启动探测：服务名到底是哪个、有没有拿到
+          rs: this.probe.remoteSettings === true ? "y" : "n",
+          ns: this.probe.nestedSettings === true ? "y" : "n",
+          rm: this.probe.remote === true ? "y" : "n",
+          perr: this.probe.remoteSettingsError || this.probe.nestedSettingsError || "",
         };
       }
 
@@ -1506,6 +1526,23 @@ window.__ModuleLoader__.load({
       let bridgeOff;
       const bridge = createBridge(EMPTY_CARD_STATE);
 
+      /**
+       * 启动期探测结果。
+       *
+       * 这几个布尔值决定面板能否配置，而它们在界面上此前完全不可见 ——
+       * 「控制器没建」到底是服务名不对、还是服务没就绪，光看界面分不出来。
+       * 记下来，连同诊断一起画出去。
+       */
+      const bootProbe = {
+        remoteSettings: false,
+        nestedSettings: false,
+        remote: false,
+        remoteSettingsError: "",
+        nestedSettingsError: "",
+        installed: false,
+        installError: "",
+      };
+
       /** 把某个控制器的投影接到 bridge 上（换控制器时自动断开旧的）。 */
       const bindController = (next) => {
         bridgeOff?.();
@@ -1553,7 +1590,13 @@ window.__ModuleLoader__.load({
         bridgeOff?.();
         bridgeOff = undefined;
         controller?.dispose();
-        controller = new MemoryCardController(scopeCtx, settings, upgrade ? hostScope : undefined);
+        controller = new MemoryCardController(
+          scopeCtx,
+          settings,
+          upgrade ? hostScope : undefined,
+          bootProbe,
+        );
+        bootProbe.installed = true;
         bindController(controller);
       };
 
@@ -1575,13 +1618,19 @@ window.__ModuleLoader__.load({
       const readSettings = (anyCtx) => {
         try {
           const direct = anyCtx.get?.("remote.settings");
+          bootProbe.remoteSettings = direct !== undefined;
           if (direct !== undefined) return direct;
-        } catch {
-          // 某些上下文里 get 也可能抛，落到下面的兼容读法
+        } catch (error) {
+          bootProbe.remoteSettingsError = String(error?.message ?? error);
         }
         try {
-          return anyCtx.get?.("remote")?.settings;
-        } catch {
+          const parent = anyCtx.get?.("remote");
+          bootProbe.remote = parent !== undefined;
+          const nested = parent?.settings;
+          bootProbe.nestedSettings = nested !== undefined;
+          return nested;
+        } catch (error) {
+          bootProbe.nestedSettingsError = String(error?.message ?? error);
           return undefined;
         }
       };

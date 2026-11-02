@@ -651,7 +651,7 @@ if (client !== undefined) {
     );
     ok(
       "有 remote.settings 的兼容读法",
-      src.includes('anyCtx.get?.("remote")?.settings'),
+      src.includes('anyCtx.get?.("remote")'),
     );
     ok(
       "inject 里两件都声明（与官方一致）",

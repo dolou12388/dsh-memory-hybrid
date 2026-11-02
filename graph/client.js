@@ -28,7 +28,7 @@ window.__ModuleLoader__.load({
     const NS = "dsh-memory-graph";
     /** 跨包契约：核心插件的 RPC 通道（见 plugin/src/graph/rpc.js）。 */
     const CHANNEL = "/memory-hybrid";
-    const CLIENT_VERSION = "0.2.0";
+    const CLIENT_VERSION = "0.2.1";
 
     const KIND = {
       episodic:   { color: "#9B8CFF", label: "情节" },
@@ -857,6 +857,14 @@ window.__ModuleLoader__.load({
         borderTop: `1px ${dash ? "dashed" : "solid"} ${color}`,
         opacity: dash ? 0.95 : 0.8,
       }),
+      // 空库提示。放在画布正中，但要跟图例（右上）和详情卡（左下）错开。
+      empty: {
+        position: "absolute", left: 0, right: 0, top: "42%",
+        display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
+        textAlign: "center", padding: "0 24px", pointerEvents: "none", zIndex: 1,
+      },
+      emptyTitle: { fontSize: 14, color: "#8a93a0" },
+      emptyHint: { fontSize: 12, lineHeight: 1.8, color: "#5f6a7a", maxWidth: 420 },
     };
 
     function gauge(label, value, shown, color) {
@@ -1016,6 +1024,15 @@ window.__ModuleLoader__.load({
       return h("div", { style: styles.wrap, key: tick }, bar,
         h("div", { style: styles.canvasHost, ref: hostRef },
           h(Legend, { stats }),
+          // 空库时画布是全黑的，和图例、控件摆在一起看着像加载失败。
+          // 必须先于「有没有数据」给一句人话，否则用户唯一能做的就是去翻日志。
+          state.status === "ready" && (stats.memories ?? 0) === 0 &&
+            h("div", { style: styles.empty },
+              h("div", { style: styles.emptyTitle }, "这个记忆库还是空的"),
+              h("div", { style: styles.emptyHint },
+                "图谱只画已经写入的记忆。先正常聊几轮，让记忆积累起来；",
+                "或者用 tools/seed-store.mjs 灌一份样本先看效果（看完记得 --clear）。"),
+            ),
           h(DetailCard, {
             node: selected,
             neighbors,

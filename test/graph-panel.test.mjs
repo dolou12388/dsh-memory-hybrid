@@ -89,17 +89,48 @@ ok("导出 neighborsOf", typeof neighborsOf === "function");
 
 group("[0] 源码卫生");
 
+let topKeys = [];
 {
   const stylesBody = source.slice(source.indexOf("const styles = {"));
   const end = stylesBody.indexOf("\n    };");
   const block = stylesBody.slice(0, end > 0 ? end : stylesBody.length);
 
   // 只数顶层键：每行形如 `  key: ...`（四空格缩进），嵌套对象缩进更深。
-  const topKeys = [...block.matchAll(/^ {6}(\w+):/gm)].map((m) => m[1]);
+  topKeys = [...block.matchAll(/^ {6}(\w+):/gm)].map((m) => m[1]);
   const dupes = topKeys.filter((k, i) => topKeys.indexOf(k) !== i);
   eq("styles 顶层键无重复", [...new Set(dupes)], []);
   ok("styles 含顶栏键 topbar", topKeys.includes("topbar"), topKeys.join(","));
   ok("styles 仍有进度条键 bar", topKeys.includes("bar"));
+}
+
+/* ------------------------------------------------------------------ *
+ * [0b] 空库必须有空态提示
+ * ------------------------------------------------------------------ *
+ * 空库时 `status` 已经是 ready，只是 stats.memories 为 0。原来的渲染直接
+ * 画一片全黑画布 —— 图例在右上、控件在顶栏，看起来跟「加载失败」一模一样，
+ * 用户唯一能做的就是去翻日志。这条断言守住「有话说」这件事。
+ *
+ * 浏览器半在 node 里渲染不出来，所以只做静态检查：确认空态分支存在、
+ * 且判定条件真的是 memories === 0（而不是别的字段）。
+ */
+
+group("[0b] 空态提示");
+
+{
+  ok(
+    "有空态分支（stats.memories === 0）",
+    /stats\.memories\s*\?\?\s*0\)\s*===\s*0/.test(source),
+    "空库会退化成一片黑画布，看不出是没数据还是坏了",
+  );
+  ok("空态文案存在", source.includes("这个记忆库还是空的"));
+  ok(
+    "空态提示了下一步怎么办",
+    source.includes("seed-store.mjs"),
+    "只说「空的」等于把用户推去翻日志",
+  );
+  ok("有空态样式 empty", topKeys.includes("empty"), topKeys.join(","));
+  // 与图例（右上）、详情卡（左下）都要错开，否则一有数据就互相压
+  ok("空态不拦指针", /empty:\s*\{[\s\S]{0,400}?pointerEvents:\s*"none"/.test(source));
 }
 
 /* ------------------------------------------------------------------ *

@@ -185,14 +185,44 @@ if (CLEAR_ONLY) {
   process.exit(0);
 }
 
-// 样本：有就复用，没有再生成（生成器的输出是确定性的，同 seed 逐字节一致）
+/*
+ * 样本缓存。
+ *
+ * 生成器的输出是确定性的（同 seed 同 nodes 逐字节一致），所以缓存可以复用 ——
+ * 但**只在这个缓存的规模确实等于本次请求的规模时**才能复用。
+ *
+ * 这里原来写的是 `!existsSync(SEED) || NODES !== 420`，即「非 420 就重新生成」，
+ * 结果反了：请求 420 时永远复用任何既有缓存，哪怕那份缓存是上一次 --nodes 12
+ * 留下的 12 节点文件。于是「灌 420 条」静默灌进去 12 条，还打印成功。
+ * 现在以缓存文件里实际的节点数为准来判定。
+ */
 const SEED = resolve(HERE, "snapshot.seed.json");
-if (!existsSync(SEED) || NODES !== 420) {
+const cachedNodes = (() => {
+  if (!existsSync(SEED)) return undefined;
+  try {
+    const j = JSON.parse(readFileSync(SEED, "utf8"));
+    return Array.isArray(j.nodes) ? j.nodes.length : undefined;
+  } catch {
+    return undefined; // 坏文件当作没有，重新生成
+  }
+})();
+
+if (cachedNodes !== NODES) {
+  if (cachedNodes !== undefined) {
+    console.log(`  · 缓存的样本是 ${cachedNodes} 节点，本次要 ${NODES} 节点，重新生成`);
+  }
   execFileSync(process.execPath, [resolve(HERE, "make-snapshot.mjs"), "--nodes", String(NODES), "--out", SEED], {
     stdio: "inherit",
   });
 }
 const snap = JSON.parse(readFileSync(SEED, "utf8"));
+
+// 兜一层：生成器和请求不一致时宁可报错，也不要「说灌 420 实际灌 12」
+if (snap.nodes.length !== NODES) {
+  console.error(`样本节点数不符：请求 ${NODES}，实际 ${snap.nodes.length}。已中止，未改动任何数据。`);
+  db.close();
+  process.exit(1);
+}
 
 // 生成样本是纯读操作，确认放在它之后 —— 先让人看到「要灌多少」再问要不要灌
 console.log("");

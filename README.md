@@ -247,17 +247,28 @@ python -m http.server 8787              # 在 tools/ 下执行，然后开
 
 ### 想在自己的库上先看看效果
 
-库里没记忆时面板是空的。`tools/seed-store.mjs` 可以把 `make-snapshot.mjs` 的产物灌进
-真实存储，只看效果、不涉及逻辑：
+库里没记忆时面板会显示空态提示。`tools/seed-store.mjs` 可以把 `make-snapshot.mjs` 的
+产物灌进真实存储，只看效果、不涉及逻辑：
 
 ```bash
 node tools/seed-store.mjs --nodes 420   # 灌 420 节点 / 约 1400 边
 node tools/seed-store.mjs --clear       # 用完清掉（务必执行）
+node tools/seed-store.mjs --help        # 全部开关
 ```
 
-⚠ 它写的是 `~/.dsh/storages/memory_hybrid.sqlite`，也就是你**真实的记忆库**，会覆盖同名
-记录。**用完必须 `--clear`，且清完要重启 dsh** —— 插件在进程内缓存快照，运行期直接改库
-不会被感知，「刷新」拿回的还是旧数据。
+⚠ 它写的是 `~/.dsh/storages/memory_hybrid.sqlite`，也就是你**真实的记忆库**，而且第一步
+就是 `DELETE`。所以默认不会动手：
+
+- 库里有数据时会**先问一次**，要打完整的 `yes`（回车不算），并列出被覆盖的 3 条记忆原文
+  —— 得先看见自己写过什么，才知道这不是沙盒；
+- **非交互环境（管道、CI）直接拒绝**，退出码 1，一个字节都不改。要跳过确认只能显式
+  `--force`；
+- 动手前自动写一份 `memory_hybrid.sqlite.pre-seed.bak`（固定文件名，每次覆盖，不累积），
+  回滚就是把它复制回去覆盖原库。`--no-backup` 可关闭；
+- 库本来就是空的时候不问 —— 没有可毁的东西。
+
+**清完要重启 dsh** —— 插件在进程内缓存快照，运行期直接改库不会被感知，「刷新」拿回的
+还是旧数据。
 
 ---
 

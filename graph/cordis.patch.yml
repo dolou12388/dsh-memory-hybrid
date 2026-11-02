@@ -1,0 +1,14 @@
+# 图谱面板的宿主半。
+#
+# 它自己不做任何事：数据由 dsh-memory-hybrid 的 Connection RPC 通道
+# `/memory-hybrid`（endpoint `graph`）提供，这里只负责让包被加载，
+# 从而让 dsh.client 里的浏览器半进入启动图。
+#
+# 单独成包而不是塞进核心的三个理由：
+#   · 渲染代码量比核心全部 UI 加起来还大，且要频繁改视觉
+#   · 核心的零依赖承诺不该被一个可选的视图拖累
+#   · 面板崩了不该连带记忆功能（本项目的既有原则：旁路设施只能降级）
+
+- insert:
+    - id: dsh-memory-graph
+      name: dsh-memory-graph

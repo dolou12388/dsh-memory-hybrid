@@ -1,0 +1,46 @@
+{
+  "name": "dsh-memory-graph",
+  "version": "0.2.0",
+  "description": "记忆图谱：把 dsh-memory-hybrid 的记忆画成可交互的星图",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "client.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "install": {
+      "preferred": "link"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-primitives",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    }
+  },
+  "dshTarget": "0.2.0-rc.2",
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "memory",
+    "graph",
+    "star-map",
+    "deepseek-harness"
+  ],
+  "license": "MIT"
+}

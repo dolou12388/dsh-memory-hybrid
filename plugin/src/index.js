@@ -22,6 +22,7 @@ import { VectorIndex } from "./storage/vector.js";
 import { Journal } from "./storage/journal.js";
 import { runJob, recall, touchRecalled, sweep, bumpStats } from "./pipeline/pipeline.js";
 import { buildTools } from "./tools/memory.js";
+import { registerGraphRpc } from "./graph/rpc.js";
 import { effectiveEma, gainFactor } from "./mood/model.js";
 import { Embedder, probeEmbedding } from "./storage/embed-client.js";
 import { resolveEmbedConfig, describeEmbedConfig } from "./storage/embed-config.js";
@@ -429,6 +430,25 @@ export async function apply(ctx, rawConfig) {
   ctx.on("agent/turn-stopping", () => {
     // 有意留空：此处不做任何可能阻塞的事。
     // 保留这个订阅点是为了将来接入「轮末主动巩固」，现在不承担工作。
+  });
+
+  // ---- 图谱接口：只读投影，供附属面板消费 ----
+  //
+  // 只声明 `webServer`：`connection` 的 rpc.handle 有个上游缺陷（它拿
+  // connection 服务自身的 ctx 当 owner，那上面没有 webServer 许可），
+  // 所以本插件自己把前缀路由挂到 webServer 上，见 graph/rpc.js 的注释。
+  //
+  // 这里用 `ctx.inject` 延迟挂载，而**不能**写进顶层 inject —— 顶层是硬门禁，
+  // 服务不存在时 cordis 连 apply 都不调，整个插件在 headless 下会静默
+  // pending（本项目在 storageDomain 上踩过一次）。
+  // 回调里的 child 才有正确的 fiber，注册的路由会随插件卸载一起撤销。
+  ctx.inject(["webServer"], (child) => {
+    try {
+      registerGraphRpc(child, deps, log);
+    } catch (e) {
+      // 图谱接口失败不影响记忆本身：它只是少一个视图
+      log.warn("memory: graph rpc 注册失败", e?.message);
+    }
   });
 
   log.info(`memory: ready (dim=${config.dim}, autoRecall=${config.autoRecall})`);

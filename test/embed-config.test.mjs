@@ -151,9 +151,17 @@ group("[5] 继承解析：无配置文件");
   const r = resolveInheritedModel({ profileContext: { home: join(tmpdir(), "definitely-not-exist-xyz") } });
   // 机器上可能真有 ~/.dsh，所以只断言"不抛错且结构完整"
   ok("不抛错", true);
-  eq("返回字段齐全", Object.keys(r).sort(), [
+  // ⚠ 这里不能断言精确键列表：`reason` 是**失败时才有**的可选字段
+  //   （inherit.js 的两处失败分支才展开它）。本机有 ~/.dsh patch 时继承成功、
+  //   没有 reason；CI 上没有配置文件、必然带 reason。写成精确列表就会变成
+  //   「本机绿、CI 红」的环境依赖测试 —— 这正是它当初的表现。
+  const REQUIRED = [
     "apiKey", "apiKeyEnv", "baseURL", "displayName", "model", "ok", "patchFile", "provider", "source",
-  ].sort());
+  ];
+  const ALLOWED = new Set([...REQUIRED, "reason"]);
+  eq("必有字段齐全", REQUIRED.filter((k) => !(k in r)), []);
+  eq("无未声明的字段", Object.keys(r).filter((k) => !ALLOWED.has(k)), []);
+  ok("reason 若有必是字符串", r.reason === undefined || typeof r.reason === "string");
   ok("ok 是布尔值", typeof r.ok === "boolean");
 }
 

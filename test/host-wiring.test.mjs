@@ -10,11 +10,21 @@
  * 用法：node test/host-wiring.test.mjs
  */
 
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { mkdtempSync, rmSync, existsSync, statSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { requireHost } from "./host-locate.mjs";
+
+/**
+ * 仓库内文件的绝对路径。
+ *
+ * 这里曾经写死过 `D:/Temp/Work Buddy/dsh-memory/...` —— 本机跑得通，
+ * 推到 CI 就变成 `Cannot find module '/home/runner/.../D:/Temp/...'`。
+ * 测试文件自己的位置才是唯一可靠的锚：test/ 的上一级就是仓库根。
+ */
+const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
+const pluginPath = (...p) => join(REPO, "plugin", ...p);
 
 let pass = 0;
 let fail = 0;
@@ -133,7 +143,7 @@ async function makeHost({ backend = "json", routes = {}, root, sink }) {
 
 /** 装配插件本体 */
 async function mountPlugin(ctx, config) {
-  const url = pathToFileURL("D:/Temp/Work Buddy/dsh-memory/plugin/src/index.js");
+  const url = pathToFileURL(pluginPath("src", "index.js"));
   url.searchParams.set("t", String(Date.now() + Math.random()));
   const plugin = await import(url.href);
   await ctx.plugin({
@@ -253,7 +263,7 @@ group("[4] 端到端：写入记忆 → 落盘 → 重启读回");
   const sink = [];
   const sqliteFile = join(root, "e2e.sqlite");
   const pluginMod = await import(
-    pathToFileURL("D:/Temp/Work Buddy/dsh-memory/plugin/src/storage/domain.js").href
+    pathToFileURL(pluginPath("src", "storage", "domain.js")).href
   );
 
   // 第一轮：装配 + 真实写入记忆
@@ -285,7 +295,7 @@ group("[4] 端到端：写入记忆 → 落盘 → 重启读回");
   //   更干净的办法是等插件自身写（经 agent 管线），但那需要模型。
   //   所以这里用 SQL 直写同一张表，验证的是「落盘 → 重启读回」这一段。
   const { loadSqlite } = await import(
-    pathToFileURL("D:/Temp/Work Buddy/dsh-memory/plugin/src/storage/sqlite-engine.js").href
+    pathToFileURL(pluginPath("src", "storage", "sqlite-engine.js")).href
   );
   const SQL = await loadSqlite();
   const tmpDb = new SQL.Database(new Uint8Array(be.exportBytes()));

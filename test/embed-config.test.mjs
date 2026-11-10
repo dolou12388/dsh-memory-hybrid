@@ -341,6 +341,59 @@ group("[12] Config 每个字段都必须 volatile（否则设置页拿不到）"
   );
 }
 
+group("[12.5] 未传的配置键必须落到 schema 默认值，而不是 undefined");
+{
+  // ## 这条测试防的是什么
+  //
+  // `apply()` 拿到的 config 只保证「是解析过的对象」，**不保证包含全部键**。
+  // 只要 config 不是经 Config.parse() 产生（自定义装配、测试最小宿主、
+  // 未来任何绕过校验的入口），缺失键就是 undefined，而 undefined 在
+  // `if (config.x)` 里恒假 —— 「默认开」的功能静默变成「默认关」，且
+  // 没有任何报错。
+  //
+  // 实测踩到：instanceLock 默认 true，但未传该键时日志打 `lock=off`，
+  // 实例锁形同虚设。同类还有 autoRecall / moodInfer / dedupeInjection /
+  // sweepOnStart —— 全是「默认开」的项。
+  //
+  // ## 怎么测
+  //
+  // 复刻 plainConfig 的行为（它对每个 Config 键都装了 getter），断言：
+  //   1. 未传的键读出来等于 schema 默认值（而不是 undefined）
+  //   2. 显式传了值就以传入值为准（不能被默认值盖掉）
+  //   3. 故意没有默认值的 secret 字段读出来仍是 undefined
+  const { Config, plainConfig } = await import("../plugin/src/index.js");
+  const dict = Config.dict ?? {};
+
+  // 直接测真实实现，不在测试里复刻一份 —— 复刻等于测了个副本：
+  // 真函数改坏了，副本照样绿。
+  const plain = (raw) => plainConfig(raw);
+
+  const empty = plain({});
+  const missing = [];
+  for (const key of Object.keys(dict)) {
+    const def = dict[key]?.meta?.default;
+    if (def === undefined) continue;         // 故意无默认值的（secret）
+    if (empty[key] !== def) missing.push(`${key}: ${JSON.stringify(empty[key])} ≠ ${JSON.stringify(def)}`);
+  }
+  ok("所有带默认值的键都被补齐", missing.length === 0,
+    missing.length ? missing.join("; ") : "");
+
+  // 「默认开」的那几项单独点名 —— 它们失效时最不容易被发现
+  for (const key of ["autoRecall", "moodInfer", "dedupeInjection", "sweepOnStart", "instanceLock"]) {
+    eq(`未传时 ${key} 取默认值`, empty[key], dict[key]?.meta?.default);
+  }
+
+  // 显式传值必须优先
+  const explicit = plain({ instanceLock: false, autoRecall: false, dim: 512 });
+  eq("显式传 false 不被默认值盖掉（instanceLock）", explicit.instanceLock, false);
+  eq("显式传 false 不被默认值盖掉（autoRecall）", explicit.autoRecall, false);
+  eq("显式传值优先（dim）", explicit.dim, 512);
+
+  // 两个 secret 字段必须保持 undefined，否则 describe() 会恒报「已配置」
+  eq("jevApiKey 未传仍是 undefined", empty.jevApiKey, undefined);
+  eq("embedApiKey 未传仍是 undefined", empty.embedApiKey, undefined);
+}
+
 group("[13] 配置页控件必须与字段语义匹配（别退回纯文本框）");
 {
   // 这一组盯的是「配置页看起来像表单」这件事本身。

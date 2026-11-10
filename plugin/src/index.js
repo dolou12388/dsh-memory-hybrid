@@ -252,6 +252,37 @@ function plainConfig(raw) {
       },
     });
   }
+
+  // ---- 补齐缺失键的 schema 默认值 ----
+  //
+  // ⚠ 只遍历 raw 的自有键是不够的。schemastery 的默认值只在**它的解析
+  //   过程**里被填进去；一旦 config 不是经 `Config.parse()` 产生（自定义
+  //   装配、测试里的最小宿主、以及未来任何绕过校验的入口），缺失键就是
+  //   `undefined`，而 `undefined` 在 `if (config.x)` 里恒假 —— 于是
+  //   「默认开」的功能静默变成「默认关」。
+  //
+  //   实测踩到：`instanceLock` 默认 true，但未传该键时日志打的是
+  //   `lock=off`，实例锁形同虚设，而没有任何报错或警告。同类的还有
+  //   moodInfer / dedupeInjection / autoRecall —— 全是「默认开」的项。
+  //
+  //   所以这里按 Config 定义补默认值。顺序上让 raw 的自有键先定义，
+  //   已存在的键不会被覆盖（defineProperty 对已定义属性会重新定义，
+  //   因此用 hasOwn 判断跳过）。
+  const dict = Config?.dict ?? {};
+  for (const key of Object.keys(dict)) {
+    if (Object.prototype.hasOwnProperty.call(out, key)) continue;
+    const def = dict[key]?.meta?.default;
+    Object.defineProperty(out, key, {
+      enumerable: true,
+      // 默认值同样用 getter：raw 里后续若出现该键（设置页写入），
+      // 以 raw 为准；否则退回 schema 默认值。
+      get() {
+        const value = raw[key];
+        if (value !== undefined) return isVolatileValue(value) ? value.get() : value;
+        return def;
+      },
+    });
+  }
   return out;
 }
 
@@ -930,4 +961,11 @@ async function openMemoryDomain(ctx, storage, log) {
   return own.open(memoryDomain);
 }
 
-export { memoryDomain, DOMAIN_VERSION };
+/**
+ * 导出给测试。
+ *
+ * `plainConfig` 补默认值那段逻辑如果只在测试里复刻一遍，就等于测了个副本：
+ * 真函数改坏了副本照样绿。而这段逻辑的失效方式恰恰是**静默的**（默认开
+ * 的功能变默认关，不报错），所以必须直测真身。
+ */
+export { memoryDomain, DOMAIN_VERSION, plainConfig };

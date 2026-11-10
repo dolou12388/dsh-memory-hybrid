@@ -141,17 +141,42 @@ async function makeHost({ backend = "json", routes = {}, root, sink }) {
   return ctx;
 }
 
-/** 装配插件本体 */
+/**
+ * 装配插件本体。
+ *
+ * @returns 插件模块。要销毁时调 `disposeOf(plugin)`。
+ *
+ * ⚠ 清理只能走 `ctx.plugin()` 返回的 **fiber** 的 `dispose()`，
+ *   不是 `ctx.dispose()` —— 实测 cordis 4 的 Context 上根本没有
+ *   `dispose` 方法（`typeof ctx.dispose === "undefined"`）。写成
+ *   `ctx.dispose()` 不报错也不生效，effect 的清理函数永远不跑，
+ *   于是锁不释放、domain 不关闭。第一版就踩了这个，导致「重启」用例
+ *   里第一轮的锁一直held，第二轮正确判为另一实例并降级只读。
+ *
+ * ⚠ 不能把 fiber 挂到 plugin 上：ESM 的模块命名空间对象不可扩展
+ *   （`Cannot add property dispose, object is not extensible`）。
+ *   所以用 WeakMap 记。
+ */
+const FIBERS = new WeakMap();
 async function mountPlugin(ctx, config) {
   const url = pathToFileURL(pluginPath("src", "index.js"));
   url.searchParams.set("t", String(Date.now() + Math.random()));
   const plugin = await import(url.href);
-  await ctx.plugin({
+  const fiber = await ctx.plugin({
     name: plugin.name,
     inject: plugin.inject,
     apply: (c, cfg) => plugin.apply(c, cfg),
   }, config);
+  FIBERS.set(plugin, fiber);
   return plugin;
+}
+
+/** 销毁某个已装配的插件实例（释放锁、关 domain、移除监听）。 */
+async function disposeOf(plugin) {
+  const fiber = plugin ? FIBERS.get(plugin) : null;
+  if (!fiber) return;
+  FIBERS.delete(plugin);
+  try { await fiber.dispose?.(); } catch { /* 已销毁则忽略 */ }
 }
 
 const BASE_CONFIG = {
@@ -294,9 +319,22 @@ group("[4] 端到端：写入记忆 → 落盘 → 重启读回");
   //   内存库，再借 create 出来的实例读回。
   //   更干净的办法是等插件自身写（经 agent 管线），但那需要模型。
   //   所以这里用 SQL 直写同一张表，验证的是「落盘 → 重启读回」这一段。
+  //
+  // ⚠⚠ 覆盖库文件之前**必须先 await be.flush()**。
+  //   后端是「改内存 → 标 dirty → setTimeout(0) 合并落盘」。domain 一打开
+  //   就已经 dirty 且挂着一个 pending 定时器了（打开过程要写 domains 表）。
+  //   若此时直接 writeFileSync 覆盖库文件，那个 pending 回调随后会拿
+  //   **内存里没有 m1 的旧库**把刚写进去的数据整份盖掉 —— 第二轮自然是空的。
+  //   这是本机绿、CI 红的那种竞态：本地 makeHost 的 await 恰好把 flush
+  //   排在了覆盖之前，换个 Node 版本/机器就可能反过来。
+  //   flush() 会清掉 pending 定时器并落盘，此后 dirty=false，不再自己写。
   const { loadSqlite } = await import(
     pathToFileURL(pluginPath("src", "storage", "sqlite-engine.js")).href
   );
+  await be.flush();
+  ok("落盘已排空（可安全覆盖）", be.dirty === false && !be.flushTimer,
+    `dirty=${be.dirty} timer=${!!be.flushTimer}`);
+
   const SQL = await loadSqlite();
   const tmpDb = new SQL.Database(new Uint8Array(be.exportBytes()));
   const putSql = "INSERT INTO u_memory_hybrid__memories (key, ver, body) VALUES (?,?,?)";
@@ -320,7 +358,31 @@ group("[4] 端到端：写入记忆 → 落盘 → 重启读回");
   const patched = tmpDb.export();
   tmpDb.close();
 
-  // 把补丁字节写回库文件（模拟「插件写入并落盘」的结果）
+  // ⚠ 顺序很重要：**先销毁第一轮实例，再把补丁字节写回库文件**。
+  //
+  //   反过来（先写文件、后 dispose）会前功尽弃：dispose → domain.close()
+  //   → backend.close() 一律 `flushNow({force:true})`，拿**内存里没有 m1
+  //   的旧库**整份覆盖磁盘 —— 刚写进去的数据当场被抹掉，第二轮读到 0 条。
+  //
+  //   而「重启」这个语义本来就该是：实例先停（它把该落的盘落完），
+  //   磁盘才是唯一的事实。之后用户/外部工具动文件，再起新实例读。
+  //
+  //   所以：flush 排空 → dispose（落盘 + 释放锁 + 关句柄）→ 写补丁文件
+  //   → 新 Context 读回。这条先后关系与真实进程重启一致。
+  //
+  //   ⚠ 必须先销毁第一轮实例再开第二轮：实例锁在 apply 时抢、在 effect
+  //     清理时释放。真实「重启」是进程退出 → 锁随进程消失，第二个进程
+  //     自然抢得到。本测试是同一进程内模拟重启，第一轮 ctx1 活着、锁还
+  //     held 着；不销毁就装第二轮，第二轮会**正确地**判定「另一实例在写」
+  //     并降级只读 —— 它是照设计工作的，但日志带 [只读]，写入类断言必然失败。
+  //
+  //   ⚠ 用 disposeOf(plugin1)（fiber.dispose），不是 ctx1.dispose()：
+  //     cordis 4 的 Context 上没有 dispose 方法，调用它不报错也不生效。
+  await disposeOf(plugin1);
+  ok("第一轮实例已销毁（锁应已释放）", !existsSync(`${sqliteFile}.lock`),
+    existsSync(`${sqliteFile}.lock`) ? "锁文件仍在" : "");
+
+  // 现在磁盘是唯一事实源：把补丁字节写回库文件（模拟外部写入的结果）
   const { writeFileSync } = await import("node:fs");
   writeFileSync(sqliteFile, patched);
   ok("库文件已写入数据", statSync(sqliteFile).size > 28672, `${statSync(sqliteFile).size} bytes`);

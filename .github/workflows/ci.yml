@@ -1,0 +1,129 @@
+name: CI
+
+# 目的很收敛：保证「没装宿主也能全绿」和「装了宿主真跑得起来」这两件事
+# 在不同 Node 版本上持续成立。不发布、不打包、不跑图谱面板（那在独立仓库）。
+#
+# 为什么要在 CI 里真的装 dsh：
+#   host-wiring 这个套件的价值全在「真实 cordis 装配时序」上 —— 用替身
+#   mock 出来的时序不会复现「插件注册后端晚于 storage-domain 的 apply」
+#   这类问题，而那正是它唯一要守的东西。所以 CI 必须能拿到真宿主。
+#
+# 拿不到时（例如上游包未公开发布）该套件会自己 skip 并以 0 退出，
+# 不会把 CI 拖红；此时 job 摘要里会出现"跳过"，那是有意的信号而不是故障。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # engines 要求 >=20；22 与 24 覆盖当前 LTS 与最新线。
+        # 不测 21/23 这类奇数版本：本项目只处理「用户真会装的那个」。
+        node: ['20', '22', '24']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: 安装宿主 dsh（用于真实装配测试）
+        id: host
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # 装到仓库外的独立目录，避免污染本包的 files 清单与 node_modules 语义
+          mkdir -p "$RUNNER_TEMP/host"
+          cd "$RUNNER_TEMP/host"
+          npm init -y >/dev/null 2>&1
+          # 优先装与 dshTarget 匹配的版本；装不到就退回 latest
+          TARGET="$(node -p "require('$GITHUB_WORKSPACE/package.json').dshTarget" 2>/dev/null || echo '')"
+          if [ -n "$TARGET" ] && npm install --no-audit --no-fund "@deepseek-ai/dsh@$TARGET" 2>/dev/null; then
+            echo "installed pinned $TARGET"
+          else
+            echo "pinned version unavailable, falling back to latest"
+            npm install --no-audit --no-fund @deepseek-ai/dsh
+          fi
+
+      - name: 告诉测试宿主在哪
+        if: steps.host.outcome == 'success'
+        run: |
+          set -euo pipefail
+          # 逐包解析由测试自己完成，这里只需指到 @deepseek-ai 作用域目录。
+          # 找不到就直接不设 —— 测试仍会自己走运行时锚点搜索。
+          FOUND="$(cd "$RUNNER_TEMP/host" && node -e "try{const p=require.resolve('@deepseek-ai/dsh/package.json');console.log(require('path').dirname(p))}catch(e){process.exit(1)}" 2>/dev/null || true)"
+          if [ -n "$FOUND" ]; then
+            echo "DSH_TEST_HOST=$(dirname "$FOUND")" >> "$GITHUB_ENV"
+            echo "宿主目录：$(dirname "$FOUND")"
+          else
+            echo "::warning::未定位到宿主包目录，真实装配测试将被跳过"
+          fi
+
+      - name: 语法检查（所有源文件能否被解析）
+        run: |
+          set -euo pipefail
+          fail=0
+          count=0
+          # 注意括号：`-name a -o -name b -print0` 里的 -print0 只作用于 b，
+          # 会让 .js 文件全被静默漏检。必须用 \( ... \) 把两个条件括起来。
+          while IFS= read -r -d '' f; do
+            count=$((count + 1))
+            node --check "$f" || { echo "::error file=$f::语法错误"; fail=1; }
+          done < <(find plugin/src test tools \( -name '*.js' -o -name '*.mjs' \) -print0)
+          echo "已检查 $count 个文件"
+          exit $fail
+
+      - name: 全套测试
+        run: node test/run-all.mjs
+
+      - name: 核对发行包内容（files 清单是否漏了必需文件）
+        run: |
+          set -euo pipefail
+          # npm pack --dry-run 会把 files 清单渲染成文件列表；
+          # 用它验证「声明要发的文件真的存在」，防止 rename 后忘记改 files。
+          # 用管道而不是先落盘再读：落盘路径在 Windows 与 Linux 之间不一致。
+          npm pack --dry-run --json | node -e '
+          let s = "";
+          process.stdin.on("data", (d) => (s += d)).on("end", () => {
+            const data = JSON.parse(s);
+            const files = (data[0]?.files ?? []).map((f) => f.path);
+            const required = [
+              "plugin/src/index.js",
+              "plugin/client.js",
+              "package.json",
+              "README.md",
+              "LICENSE",
+            ];
+            const missing = required.filter((r) => !files.includes(r));
+            if (missing.length) {
+              console.error("::error::发行包缺少必需文件：" + missing.join(", "));
+              process.exit(1);
+            }
+            console.log(`发行包 ${files.length} 个文件，必需项齐全`);
+          });
+          '
+
+      - name: 依赖零外部包（本插件的核心承诺）
+        run: |
+          set -euo pipefail
+          node -e '
+          const fs = require("node:fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const deps = Object.keys(pkg.dependencies ?? {});
+          if (deps.length > 0) {
+            console.error("::error::本插件应零外部依赖，但 dependencies 里有：" + deps.join(", "));
+            process.exit(1);
+          }
+          console.log("dependencies 为空 ✓");
+          '

@@ -17,6 +17,14 @@ export const RPC_CHANNEL = "/memory-hybrid";
 const RPC_ID_FALLBACK = "invalid-request";
 
 /**
+ * 单次快照的节点数上限。
+ *
+ * 图谱面板实际能渲染的规模远小于此，但夹紧的意义不在面板：`limit` 来自
+ * 网络请求，不夹就能用一次调用触发全库物化与全量序列化。
+ */
+const SNAPSHOT_MAX = 2000;
+
+/**
  * 自己把 channel 挂到 webServer 的前缀路由表上。
  *
  * ## 为什么不用 `connection.rpc.handle()`
@@ -43,12 +51,20 @@ const RPC_ID_FALLBACK = "invalid-request";
  * 信封格式也是公开的（`clientRequestSchema` / `serverResponseSchema`），
  * 两边都是稳定契约，中间那一层只是簿记。
  *
- * ## 代价
+ * ## 代价与回补
  *
- * 少了上游的 Host/Origin 围栏与浏览器鉴权。这对本通道可接受：
- * `/memory-hybrid/graph` 是只读投影，返回的是本机用户的记忆摘要，
- * 不写库、不接受外部输入影响持久状态。真要收紧，可以在 `fetch` 里
- * 复用 `connection.admit(request)` —— 它是公开方法。
+ * 自己挂路由少了上游的 Host/Origin 围栏与浏览器鉴权。本通道是只读投影
+ * （返回本机用户的记忆摘要，不写库、不接受外部输入影响持久状态），风险
+ * 面比写接口小得多，但**不等于可以裸奔**：
+ *
+ *   · 同一个 webServer 上通常还挂着 /api/** 的写接口，抓不到 Host 围栏
+ *     就意味着任何能发起跨站请求的页面都能读到用户的记忆摘要；
+ *   · 「本机」不等于「可信」—— 浏览器里的任意网页都是本机进程。
+ *
+ * 所以这里复用 `connection.admit(request)`：它是公开方法，返回
+ * `{ peer }` 或 `{ rejection: 401|403 }`，用的正是宿主对其它通道的同一套
+ * 判定。拿不到 connection 服务时（headless / 精简装配）退回一条**保守**
+ * 的 Origin/Host 自检 —— 宁可让面板显示"未授权"，也不要默认放行。
  *
  * @param {import("@deepseek-ai/cordis").Context} webCtx 已就绪 webServer 的子上下文
  * @param {(endpoint: string, payload: unknown) => Promise<object>} handler
@@ -56,6 +72,61 @@ const RPC_ID_FALLBACK = "invalid-request";
  */
 function mountChannel(webCtx, handler) {
   const prefix = RPC_CHANNEL;
+
+  /**
+   * 请求准入。
+   *
+   * 优先走宿主的 `connection.admit()` —— 它实现了与其它通道完全一致的
+   * Trust/Host 判定。没有 connection 服务时退回自检，且自检是**失败即拒**：
+   * 写接口都在同一个 webServer 上，放行等于把记忆摘要暴露给任意网页。
+   *
+   * ⚠ 取服务必须用 `ctx.reflect.get()`，不能 `webCtx.connection`：
+   *   cordis 对未声明的服务做属性访问保护，直接读会抛
+   *   `cannot get property "connection" without inject`。而这里恰恰不能
+   *   声明它 —— 顶层 inject 是硬门禁，headless 下没有 connection 会让整个
+   *   插件静默 pending（本项目在 storageDomain 上踩过一次）。reflect.get
+   *   是 cordis 提供的「无 inject 要求」读取入口，语义正好。
+   *
+   * @returns {number|undefined} 需要拒时返回 HTTP 状态码，放行返回 undefined
+   */
+  const admit = (req) => {
+    const conn = (() => {
+      try {
+        const c = typeof webCtx.reflect?.get === "function"
+          ? webCtx.reflect.get("connection")
+          : null;
+        return typeof c?.admit === "function" ? c : null;
+      } catch {
+        return null;
+      }
+    })();
+
+    if (conn) {
+      try {
+        const out = conn.admit({ headers: req.headers });
+        if (out?.rejection) return out.rejection;
+        if (out?.peer) return undefined;
+        // 既无 peer 也无 rejection：上游语义不清，按拒绝处理
+        return 403;
+      } catch {
+        return 403;
+      }
+    }
+
+    // ---- 兜底：Origin/Host 同源校验 ----
+    //
+    // 只接受「无 Origin」（非浏览器/同源导航）或 Origin 的 host 与请求 Host
+    // 一致。这挡不住刻意伪造请求头的本地进程，但能挡住浏览器里的跨站读取 ——
+    // 而后者正是本通道真正暴露的攻击面。
+    const host = String(req.headers?.host ?? "");
+    const origin = req.headers?.origin;
+    if (!origin) return undefined;
+    try {
+      return new URL(String(origin)).host === host ? undefined : 403;
+    } catch {
+      return 403;
+    }
+  };
 
   const route = {
     kind: "prefix",
@@ -87,6 +158,15 @@ function mountChannel(webCtx, handler) {
       ) {
         res.writeHead(415);
         res.end("content type must be application/json");
+        return;
+      }
+
+      // 鉴权放在 body 解析**之前**：未授权的请求不该消耗解析成本，
+      // 也不该从「400 还是 403」的差异里泄漏通道的内部校验顺序。
+      const rejection = admit(req);
+      if (rejection) {
+        res.writeHead(rejection, { "content-type": "text/plain; charset=utf-8" });
+        res.end(rejection === 401 ? "unauthorized" : "forbidden");
         return;
       }
 
@@ -195,8 +275,13 @@ export function registerGraphRpc(ctx, deps, log) {
       return { ok: false, error: { code: "unknown-endpoint", message: `unknown endpoint "${endpoint}"` } };
     }
     try {
+      // 上限必须夹紧：`limit` 来自网络，不夹的话一次 `limit: 1e9` 就会
+      // 触发全库物化 + 全量 JSON 序列化，把只读接口变成 DoS 入口。
+      // SNAPSHOT_MAX 与面板实际能渲染的节点数量级匹配。
       const requested = Number(payload?.limit);
-      const limit = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 0;
+      const limit = Number.isFinite(requested) && requested > 0
+        ? Math.min(Math.floor(requested), SNAPSHOT_MAX)
+        : 0;
       const value = buildSnapshot(deps.domain, { limit });
 
       let maxTs = 0;

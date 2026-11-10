@@ -124,8 +124,68 @@ export const CAUSAL_THRESHOLD = 0.34;
 /** 判为「同一事实」的重复写入阈值，用于 upsert 而非新建 */
 export const DEDUP_THRESHOLD = 0.82;
 
+/**
+ * 语义嵌入空间（真 embedding）的对应阈值。
+ *
+ * 为什么必须与上面三个分开：两套向量的相似度分布完全不同。
+ * 词袋哈希共享一个关键词才 0.13～0.18，而语义模型下「毫不相干」的两句
+ * 也常有 0.2～0.3 的基线余弦（各向异性）。同一组阈值套两个空间，
+ * 不是漏建边就是全连通。
+ *
+ * 实测口径（bge-m3 / text-embedding-3-small 一类）：
+ *   完全无关        0.10 ～ 0.35
+ *   同一主题        0.45 ～ 0.65
+ *   同一事实的不同说法 0.75 ～ 0.90
+ */
+export const SEM_REL_THRESHOLD = 0.52;
+export const SEM_CAUSAL_THRESHOLD = 0.68;
+export const SEM_DEDUP_THRESHOLD = 0.90;
+
+/** 词汇通道的最小余弦。低于它连候选都不进，避免「不过滤」退化成全量注入。 */
+export const MIN_VEC_SIM = 0.12;
+
+/**
+ * 召回的绝对分数下限。
+ *
+ * 为什么必须有：重排四项权重里 importance/retention/recency 合计 0.45，
+ * 而一条刚写入的 important 记录这三项几乎满分 → 基线就有 0.39。
+ * 只要进了候选池，它几乎必然排在前面。库小的时候表现为「每轮把全部
+ * 记忆灌进上下文」，库大的时候表现为「弱相关条目污染上下文」。
+ *
+ * 0.60 的含义（权重见 WEIGHTS）：仅当 sim ≳ 0.40 时，一条普通
+ * active 记录才够得着。低于它宁可这一轮不注入 —— 没有召回比错误召回好。
+ */
+export const RECALL_MIN_SCORE = 0.60;
+
 export const RECALL_TOP_K = 6;
 export const SCORE_QUANTUM = 0.05;
+
+/**
+ * 注入的字符预算。
+ *
+ * 单条最长 MAX_LEN=800，默认 6 条 → 最坏 4800 字，中文约 4000+ token，
+ * 每轮都付。加总预算后按分数从高到低填，超出即停：宁可少给一条，
+ * 不要让记忆挤掉用户正文。
+ */
+export const INJECT_CHAR_BUDGET = 1200;
+/** 单条注入的截断长度。召回里保留全文，注入时只给结论。 */
+export const INJECT_ITEM_MAX = 300;
+
+/**
+ * 记忆容量与清理。
+ *
+ * dormant 不再是「永不删除」的终点：超过 DORMANT_TTL_DAYS 且从未被唤醒的
+ * 条目按「已彻底遗忘」清理，连同它的关联边一起删。总条数超 MEM_CAP 时，
+ * 从权重最低的 dormant 开始淘汰。
+ *
+ * 为什么要有上限：召回是暴力余弦 + 每轮全量落盘，无上限的库在几个月后
+ * 必然拖慢每一轮，而用户不会知道原因。
+ */
+export const DORMANT_TTL_DAYS = 365;
+export const MEM_CAP = 50_000; // read at runtime from config.memCap; this is the default
+
+/** 已失败 journal 记录的保留期。超期清理并计数，避免队列表无限膨胀。 */
+export const FAILED_JOB_TTL_DAYS = 7;
 
 export const WEIGHTS = Object.freeze({
   sim: 0.55,

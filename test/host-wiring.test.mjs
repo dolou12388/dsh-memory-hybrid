@@ -13,11 +13,8 @@
 import { join } from "node:path";
 import { mkdtempSync, rmSync, existsSync, statSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-
-const HOST = "D:/App/NodeJS/24.16.0/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai";
-const hostRequire = createRequire(join(HOST, "dsh/package.json"));
+import { requireHost } from "./host-locate.mjs";
 
 let pass = 0;
 let fail = 0;
@@ -35,20 +32,31 @@ function group(t) { console.log(`\n${t}`); }
  * 加载真实宿主模块
  * ------------------------------------------------------------------ */
 
-const cordisUrl = pathToFileURL(join(HOST, "cordis/lib/index.js"));
-const { Context } = await import(cordisUrl.href);
+// 宿主路径不再写死：由 test/host-locate.mjs 统一解析（复用插件的锚点搜索）。
+// 环境里没有 dsh 时它会打印原因并按 skip 退出（退出码 0），不会伪装成失败。
+const HOST = requireHost("宿主装配测试");
 
-const storageMod = await import(pathToFileURL(join(HOST, "dsh-storage/lib/index.js")).href);
-const domainMod = await import(pathToFileURL(join(HOST, "dsh-storage-domain/lib/index.js")).href);
-const jsonMod = await import(pathToFileURL(join(HOST, "dsh-storage-json/lib/index.js")).href);
+const cordisUrl = HOST.urlOf("cordis");
+const { Context } = await import(cordisUrl);
+
+const storageMod = await import(HOST.urlOf("dsh-storage"));
+const domainMod = await import(HOST.urlOf("dsh-storage-domain"));
+const jsonMod = await import(HOST.urlOf("dsh-storage-json"));
 
 const { Storage, storageBackendServiceKey } = storageMod;
 const { DomainFacility, defineDomain, domainTable } = domainMod;
 const { JsonStorageBackend } = jsonMod;
 
-const cordisVer = hostRequire("@deepseek-ai/cordis/package.json").version;
-console.log("宿主版本：cordis", cordisVer,
-  "| storage", hostRequire("@deepseek-ai/dsh-storage/package.json").version);
+console.log("宿主版本：dsh", HOST.version,
+  "| cordis", readPkg(HOST.urlOf("cordis", "package.json"))?.version ?? "?",
+  "| storage", readPkg(HOST.urlOf("dsh-storage", "package.json"))?.version ?? "?");
+
+/** 读宿主包的版本号。缺文件时返回 null（不影响测试）。 */
+function readPkg(fileUrl) {
+  try {
+    return JSON.parse(readFileSync(new URL(fileUrl), "utf8"));
+  } catch { return null; }
+}
 
 /* ------------------------------------------------------------------ *
  * 最小宿主

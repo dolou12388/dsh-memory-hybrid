@@ -109,10 +109,29 @@ export class Embedder {
     this.lastError = "";
     this.okCount = 0;
     this.failCount = 0;
+    /** 最近一次失败时刻。与 failCount 一起决定是否暂停重试。 */
+    this.lastFailAt = 0;
   }
 
   /** 当前是否具备语义嵌入能力（不是"配置了"，而是"上次调用成功了"） */
   get semantic() { return this.okCount > 0 && this.dim > 0; }
+
+  /**
+   * 现在能不能尝试语义嵌入。
+   *
+   * 与 `semantic` 的区别：`semantic` 是"成功过"，`ready()` 是"值得一试"。
+   * 区别在于**配置是否齐全** —— 配置齐全但还没成功过时，第一次调用
+   * 应当真的去试（那就是"接线"本身）；配置不齐全时不该白等一个超时。
+   *
+   * 连续失败太多次后短暂跳过，避免每轮都等一次 8s 超时把 worker 拖死。
+   */
+  ready() {
+    const cfg = safeResolve(this.resolve);
+    if (!cfg?.url || !cfg?.model || !cfg?.apiKey) return false;
+    // 连续失败 5 次后暂停 5 分钟再试
+    if (this.failCount >= 5 && Date.now() - (this.lastFailAt ?? 0) < 300_000) return false;
+    return true;
+  }
 
   /**
    * 批量嵌入。
@@ -180,6 +199,7 @@ export class Embedder {
         const body = await res.text().catch(() => "");
         this.lastError = `http-${res.status}${body ? `: ${body.slice(0, 160)}` : ""}`;
         this.failCount += 1;
+        this.lastFailAt = Date.now();
         return null;
       }
 
@@ -188,6 +208,7 @@ export class Embedder {
       if (!vecs) {
         this.lastError = "响应里认不出向量字段";
         this.failCount += 1;
+        this.lastFailAt = Date.now();
         return null;
       }
       return vecs;
@@ -195,6 +216,7 @@ export class Embedder {
       const msg = e?.name === "AbortError" ? "timeout" : (e?.message ?? String(e));
       this.lastError = msg;
       this.failCount += 1;
+      this.lastFailAt = Date.now();
       return null;
     } finally {
       clearTimeout(timer);

@@ -71,6 +71,16 @@ function anchors(ctx) {
   const forced = process.env.DSH_MEMORY_HOST_PKG;
   if (forced && existsSync(forced)) seen(list, forced);
 
+  // 0b. 显式指到 @deepseek-ai 目录（测试与 CI 用）
+  //
+  // 两种布局都要覆盖：外层 `<scope>/dsh/package.json`，以及 dsh 把依赖
+  // 嵌套安装时 `<scope>/dsh/node_modules/@deepseek-ai/dsh/package.json`。
+  const forcedScope = process.env.DSH_TEST_HOST;
+  if (forcedScope && existsSync(forcedScope)) {
+    seen(list, join(forcedScope, "dsh", "package.json"));
+    seen(list, join(forcedScope, "dsh", "node_modules", "@deepseek-ai", "dsh", "package.json"));
+  }
+
   // 1. 宿主注入的 ctx.baseDir（若存在）——最可靠，直指 profile 根
   for (const key of ["baseDir", "root", "cwd"]) {
     const v = ctx?.[key];
@@ -111,13 +121,38 @@ export function hostRequire(spec) {
   cached ??= new Map();
   if (cached.has(spec)) return cached.get(spec);
 
+  const { mod } = load(spec);
+  cached.set(spec, mod);
+  return mod;
+}
+
+/**
+ * 解析宿主模块的**文件路径**（不加载）。
+ *
+ * 与 `hostRequire` 共用同一套锚点与缓存，因此两者永不给出不一致的答案。
+ * 测试用它反推宿主包目录，运维排查用它确认「到底加载的是哪一份」。
+ *
+ * @param {string} spec 模块名
+ * @returns {string} 绝对路径
+ */
+export function hostResolve(spec) {
+  const key = `resolve:${spec}`;
+  cached ??= new Map();
+  if (cached.has(key)) return cached.get(key);
+  const { file } = load(spec);
+  cached.set(key, file);
+  return file;
+}
+
+/** 实际执行锚点搜索。两个 public 入口共用，避免逻辑分叉。 */
+function load(spec) {
   const tried = [];
   for (const pkg of anchors()) {
     try {
       if (!pkg || !existsSync(pkg)) continue;
-      const mod = createRequire(pkg)(spec);
-      cached.set(spec, mod);
-      return mod;
+      const req = createRequire(pkg);
+      const file = req.resolve(spec);
+      return { mod: req(spec), file };
     } catch { tried.push(pkg); }
   }
 

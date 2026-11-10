@@ -21,10 +21,22 @@
       config:
         autoRecall: true
         recallLimit: 6
+        # 召回绝对下限与注入预算。没有下限时重排基线分就有 0.39，
+        # 库小会表现为「每轮把全部记忆灌进上下文」。
+        recallMinScore: 0.6
+        injectCharBudget: 1200
         dim: 256
         contextOrder: 10500
+        dedupeInjection: true
         jevEndpoint: ''
         jevModel: jev-1.14.0
+        # 内置措辞推断心情。关掉后只认 journal 载荷里的显式 mood 字段。
+        moodInfer: true
+        # dormant 超期清理与总容量上限，防止库无限增长拖慢每一轮。
+        dormantTtlDays: 365
+        memCap: 50000
+        # 实例锁：防两个进程同时写同一库导致静默互相覆盖。
+        instanceLock: true
         sweepOnStart: true
         verbose: false
         # auto 优先自带 sqlite；json 沿用 profile 路由

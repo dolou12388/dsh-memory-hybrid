@@ -37,7 +37,7 @@
 
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync,
-  renameSync, unlinkSync, openSync, fsyncSync, closeSync,
+  renameSync, unlinkSync, openSync, fsyncSync, closeSync, chmodSync,
 } from "node:fs";
 import { join, dirname, basename } from "node:path";
 
@@ -184,13 +184,21 @@ function execute(db, sql, params = []) {
  * 新文件，不会看到半个。先 fsync 再 rename 是关键顺序 —— 反过来的话，
  * 断电可能换来一个「已经改名成功但内容还是空」的文件，那是真正的数据
  * 丢失，比不落盘更糟。
+ *
+ * ## 权限
+ *
+ * 记忆库里是用户的对话原文，可能含凭据、内网地址、客户名。默认 umask 022
+ * 下 `writeFileSync` 得到 0644 —— 同机其他用户可读。这里显式收紧到 0600。
+ *
+ * Windows 上 mode 不生效（ACL 由父目录继承决定），这是已知局限；
+ * 文档里写明「本机多用户隔离需依赖磁盘加密或目录 ACL」。
  */
 function persistAtomically(file, bytes) {
   const dir = dirname(file);
   const tmp = join(dir, `.${basename(file)}.${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.tmp`);
 
   try {
-    writeFileSync(tmp, bytes);
+    writeFileSync(tmp, bytes, { mode: 0o600 });
     try {
       const fd = openSync(tmp, "r+");
       try { fsyncSync(fd); } finally { closeSync(fd); }
@@ -199,6 +207,9 @@ function persistAtomically(file, bytes) {
       // 此时原子性仍在，只是掉电后可能丢最后一次写入。
     }
     renameSync(tmp, file);
+    // rename 保留 tmp 的权限位，但显式再设一次：某些平台 rename 会带上
+    // 目标原有的 mode，那样收紧就白做了。
+    try { chmodSync(file, 0o600); } catch { /* Windows / 无权限时忽略 */ }
   } catch (e) {
     try { if (existsSync(tmp)) unlinkSync(tmp); } catch { /* 清理失败不掩盖原错 */ }
     throw e;
@@ -475,7 +486,7 @@ export class SqliteStorageBackend {
         backend.db = new sql.Database();
       }
     } else {
-      mkdirSync(dirname(file), { recursive: true });
+      mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
       backend.db = new sql.Database();
     }
 

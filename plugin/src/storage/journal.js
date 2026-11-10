@@ -32,6 +32,7 @@ export class Journal {
       id,
       turnId: meta.turnId,
       sessionId: meta.sessionId,
+      scope: meta.scope,
       payload,
       status: "pending",
       attempts: 0,

@@ -20,12 +20,35 @@
 | **分级** | 抽取阶段就判档：episodic / semantic / procedural / preference，重要性 0–1 |
 | **衰减** | 艾宾浩斯遗忘曲线按重要性分档衰减，低重要性的先淡出视野 |
 | **唤醒** | 被召回 = 复习，强度回升；久未用到的沉到底层但不删除 |
-| **淘汰** | 强度低于阈值的归档，可复活；不是硬删除 |
-| **心情** | 全局心情值调制召回阈值 —— 同样的记忆，心情好时更容易想起 |
+| **淘汰** | 强度低于阈值的归档，可复活；不是硬删除。超期从未唤醒的才真正清理 |
+| **心情** | 由措辞线索推断，全局心情值调制写入门槛与巩固增益 |
 
 存储是 **KV 权威层 + 向量派生索引**：向量只是索引，真相在 KV。索引损坏可重建，
-不会丢记忆。SQLite 引擎随包分发（wasm），**五个依赖字段全部未声明** ——
+不会丢记忆。SQLite 引擎随包分发（wasm），**dependencies 字段为空** ——
 装到任何 dsh 上都只有它自己一个包。
+
+索引是**双空间**的：每条记忆同时持有词袋向量（同步可得）和语义向量（异步补齐）。
+两个空间的相似度分布完全不同，各用一套阈值 —— 实测「那家店串儿不错」这句话
+只会通过语义通道召回「望京小腰烧烤」，词袋通道完全找不到它。用
+`memory_manage(action="stats")` 看「语义覆盖 N/M」即可确认语义空间是否真的在用。
+
+---
+
+## 0.5.0 修了什么
+
+上一版有三处「文档写了、代码没做」，且都是**静默失效**——不报错，用户以为在工作：
+
+1. **语义召回没接线**。`embedder` 只被构造和探测，真正的向量计算走的仍是词袋哈希。配了嵌入模型也不生效。
+2. **心情链路是死代码**。`runJob` 里写死 `extract(payload, null)`，入队时也没带 `mood`。θ 门槛和巩固增益从未被任何数据驱动过。
+3. **`forget` 名不副实**。文档说「转 dormant（不删）」，实现是 `DELETE FROM`。
+
+另外顺手修掉的（详见 `plugin/README.md`）：词边界误判导致英文关键词乱命中、
+纯问句/寒暄被当记忆写入、注入无字符预算、孤儿边永不清、dim 热改后向量通道静默失效、
+`limit` 参数无上限、RPC 无鉴权、实例锁缺失导致双进程静默覆盖。
+
+**破坏性变更**：`memory_manage` 的 `forget` 拆成可恢复的 `sleep` 与需 `confirm: true` 的
+`delete`；`DOMAIN_VERSION` 1 → 2（旧库可直接打开，无需迁移）。升级前请读
+`plugin/README.md` 第九节「0.4.0 → 0.5.0 的行为变更」。
 
 ---
 
@@ -34,14 +57,20 @@
 ```
 dsh-memory-hybrid/
 ├── plugin/                    插件包（可 npm pack 分发）
-│   ├── src/                   16 个模块
+│   ├── src/                   21 个模块
+│   │   ├── core/              参数、衰减、档位继承
+│   │   ├── mood/              model.js（二维 EMA）+ probe.js（措辞推断）
+│   │   ├── pipeline/          extract（抽取）/ guard（威胁拦截+脱敏）/ pipeline（管线）
+│   │   ├── storage/           domain、vector（双空间）、journal、lock、sqlite
+│   │   ├── tools/             memory_recall / remember / manage
 │   │   └── graph/             图谱数据出口：rpc.js（通道）+ snapshot.js（投影）
-│   ├── client.js              浏览器端：设置页 tab + 侧栏面板（1,046 行）
+│   ├── client.js              浏览器端：设置页 tab + 侧栏面板
 │   ├── vendor/sqlite/         内嵌 SQLite wasm 引擎（零外部依赖的关键）
 │   ├── cordis.patch.yml       bundle 补丁，声明插件默认配置
 │   ├── package.json           dsh.bundle.patch 指向上面那个 yml
 │   └── README.md              安装 / 设计 / 调参 / 排查，都在这
 ├── test/                      8 个套件（不随 npm 包分发）
+├── .github/workflows/ci.yml   Node 20/22/24 三档 + 真宿主装配 + 发行包核对
 └── tools/
     ├── simulate.py            设计期数值探针（不是测试）
     ├── make-snapshot.mjs      生成图谱样本快照（用真衰减公式）
@@ -168,12 +197,17 @@ core               172 项    衰减 / 心情 / 抽取 / 召回 / 管线
 backend-contract    48 项    存储后端契约
 sqlite-embedded     38 项    内嵌引擎 / 持久化 / 损坏自愈
 embed-config        83 项    嵌入配置继承 / 断言 / 设置页控件匹配
+graph-snapshot      57 项    图谱快照投影 / RPC 封套（跨包契约）
 host-wiring         33 项    真实 cordis + storage + domain 装配
-sidebar-panel       34 项    侧栏三处插槽注册（真实执行 apply）
-manifest            40 项    两份清单一致 / 版本跟上 / inject 合法
+sidebar-panel       66 项    侧栏三处插槽注册（真实执行 apply）
+manifest            43 项    两份清单一致 / 版本跟上 / inject 合法
 ```
 
 `host-wiring` 用的是宿主真实服务而非 mock —— 装配时序问题只有真 cordis 才复现得出。
+宿主路径不再写死在测试里：`test/host-locate.mjs` 复用插件自己的锚点搜索去定位，
+**找不到宿主时该套件会打印原因并按 skip 退出（退出码 0）而不是失败** ——
+没装 dsh 的环境本来就不具备跑它的条件，让它变红只会训练人忽略红色。
+CI 里会真的装一份 dsh 来跑它。
 
 `sidebar-panel` 是唯一真正执行 `plugin/client.js` 的套件：用 `new Function` 把
 浏览器端代码装进沙箱，桩掉 React 与四个宿主 UI 包，让 `apply(ctx)` 真跑一遍，
